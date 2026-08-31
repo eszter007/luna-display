@@ -5,6 +5,17 @@ from-scratch, software-only replacement for Luna Display. Written for the
 iMac Retina 5K (Late 2014), which has no Target Display Mode; it works the
 same on other Intel iMacs (e.g. the Late 2015 models).
 
+## Install (no build needed)
+
+Download both apps from the
+[latest release](https://github.com/siavosh87/luna-display/releases/latest):
+
+- **LunaReceiver** goes on the Mac that becomes the display.
+- **LunaSender** goes on the Mac whose desktop you want to extend.
+
+They are notarized, so they open normally — unzip, move to Applications,
+launch, then jump to [Setup](#setup). Building from source is optional.
+
 ## How it works
 
 1. **LunaSender** (the Mac whose display is extended, menu bar app) creates
@@ -32,13 +43,19 @@ resolutions use — text stays much sharper than a non-Retina stream.
   stock maximum macOS works.
 - Both Macs on the same network.
 
-## Build
+## Build from source (optional)
+
+Double-click **`build.command`** — it opens a Terminal window and runs the
+build for you. (If macOS blocks a downloaded copy the first time,
+right-click it and choose *Open*, or approve it under System Settings →
+Privacy & Security.) The equivalent by hand:
 
 ```sh
 ./make-apps.sh
 ```
 
-Needs Xcode (or the command line tools with Swift 5.9+). Produces
+Needs Xcode (or the command line tools with Swift 5.9+) — macOS offers to
+install the command line tools on first use. Produces
 `dist/LunaSender.app` and `dist/LunaReceiver.app`, both universal. When a
 "Developer ID Application" identity exists in the login keychain the apps
 are signed with it (and notarized when a `notarytool` keychain profile
@@ -50,13 +67,13 @@ sender).
 
 ## Setup
 
-**On the iMac (once):** copy `dist/LunaReceiver.app` over (AirDrop, USB,
+**On the iMac (once):** copy `LunaReceiver.app` over (AirDrop, USB,
 file sharing). A notarized build opens normally; other builds need
 right-click → Open the first time (Gatekeeper). It goes fullscreen and
 shows "waiting for a sender" with its address. Esc quits.
 `LunaReceiver --headless` runs the server without any window.
 
-**On the sender Mac:** `open dist/LunaSender.app`, click the ☾ menu bar
+**On the sender Mac:** launch `LunaSender.app`, click the ☾ menu bar
 icon, and pick the iMac under "Receivers on network". The first connection
 will trigger the Screen Recording permission prompt — grant it (System
 Settings → Privacy & Security → Screen & System Audio Recording), then
