@@ -5,6 +5,10 @@ from-scratch, software-only replacement for Luna Display. Written for the
 iMac Retina 5K (Late 2014), which has no Target Display Mode; it works the
 same on other Intel iMacs (e.g. the Late 2015 models).
 
+I made most of this with [Claude Code](https://claude.com/claude-code):
+I described what I wanted my old iMac to do, and Claude designed, wrote,
+and debugged the app with me.
+
 ## Install (no build needed)
 
 Download both apps from the
