@@ -97,10 +97,16 @@ final class SessionController {
 
     /// HEVC carries the full 5K frame. H.264 stays at 4K, the most the
     /// iMacs' H.264 decoders take.
+    /// 5K goes out as four 1280x2880 strips; only changed ones are encoded.
+    private static let hevcStrips = 4
     private var useHEVC: Bool { receiverDecodesHEVC && preset == .retina5KScaled }
     private var streamSize: (width: Int, height: Int) { useHEVC ? (5120, 2880) : preset.streamSize }
-    private var bitrate: Int { useHEVC ? 120_000_000 : preset.bitrate }
+    private var bitrate: Int {
+        if let override = Int(ProcessInfo.processInfo.environment["LUNA_BITRATE"] ?? ""), override > 0 { return override }
+        return useHEVC ? 120_000_000 : preset.bitrate
+    }
     private var sleepAssertion: IOPMAssertionID = 0
+    private var latencyActivity: NSObjectProtocol?
     private let fps = 60
 
     private(set) var state: State = .idle {
@@ -127,10 +133,12 @@ final class SessionController {
     /// Exposed for the --test-disconnect harness.
     var activeVirtualDisplayID: CGDirectDisplayID { virtualDisplay.displayID }
 
-    // Roughly three stream-sized frames; beyond this the link is backed up
-    // and we drop frames pre-encode so latency doesn't snowball.
+    // A quarter second of stream; beyond this the link is backed up and we
+    // drop frames pre-encode so latency doesn't snowball. Three frames' worth
+    // was crossed by single bursts (several strips' keyframes at once) and
+    // skipped frames even over Thunderbolt; acks catch real backlog sooner.
     private var maxPendingBytes: Int {
-        bitrate / 8 / fps * 3
+        bitrate / 8 / 4
     }
 
     private var preset: DisplayPreset {
@@ -221,7 +229,7 @@ final class SessionController {
                 self.disconnect()
             }
         }
-        conn.onFrameAck = { [weak self] pts in self?.frameAcked(pts) }
+        conn.onFrameAck = { [weak self] pts, receiverMicros in self?.frameAcked(pts, receiverMicros: receiverMicros) }
         conn.onMessage = { [weak self, weak conn] msg in
             guard let self, let conn, self.connection === conn else { return }
             if case .caps(let w, let h, let receiverName, _, _, let drawsCursor, let decodesHEVC) = msg {
@@ -253,7 +261,7 @@ final class SessionController {
             streamHeight: stream.height,
             fps: fps,
             senderName: Host.current().localizedName ?? "Mac",
-            tiles: useHEVC ? 2 : 1
+            tiles: useHEVC ? Self.hevcStrips : 1
         ))
 
         guard virtualDisplay.create(
@@ -285,11 +293,33 @@ final class SessionController {
             bitrate: bitrate,
             showsCursor: !receiverDrawsCursor,
             hevc: useHEVC,
-            tiles: 2
+            tiles: Self.hevcStrips
         ))
         self.encoder = encoder
-        encoder.onPacket = { [weak connection] packet in
+        encoder.onPacket = { [weak self, weak connection] packet in
             connection?.send(packet)
+            guard let self else { return }
+            self.flightLock.lock()
+            self.stats.bytes += packet.count
+            self.flightLock.unlock()
+        }
+        encoder.onStripCopied = { [weak self] seconds in
+            guard let self else { return }
+            self.flightLock.lock()
+            self.stats.copyTimes.append(seconds)
+            self.flightLock.unlock()
+        }
+        encoder.onChangeCaptured = { [weak self] seconds in
+            guard let self else { return }
+            self.flightLock.lock()
+            self.stats.changeToCapture.append(seconds)
+            self.flightLock.unlock()
+        }
+        encoder.onFrameEncoded = { [weak self] seconds in
+            guard let self else { return }
+            self.flightLock.lock()
+            self.stats.encodeTimes.append(seconds)
+            self.flightLock.unlock()
         }
         encoder.shouldDropFrame = { [weak self, weak connection] in
             guard let self, let connection else { return true }
@@ -369,12 +399,13 @@ final class SessionController {
     }
 
     /// Network queue.
-    private func frameAcked(_ pts: Int64) {
+    private func frameAcked(_ pts: Int64, receiverMicros: Int) {
         let now = Self.hostNow()
         flightLock.lock()
         acksSeen = true
         // pts is the capture time on the host clock: this is capture -> decoded on the iMac.
         stats.latencies.append(now - Double(pts) / 1_000_000)
+        stats.receiverTimes.append(Double(receiverMicros) / 1_000_000)
         inFlight = inFlight.filter { $0.key > pts }
         flightLock.unlock()
     }
@@ -385,9 +416,16 @@ final class SessionController {
         stats = StreamStats()
         flightLock.unlock()
         lunaLog("luna: last 5 s: %d frames sent, %d skipped (network), %d skipped (receiver behind), "
-                + "%d skipped (encoder busy); capture->encoder %@, capture->decoded on receiver %@",
+                + "%d skipped (encoder busy), %.0f Mbit/s; capture->encoder %@, copy %@, encode %@, "
+                + "receiver arrival->decoded %@, capture->decoded on receiver %@",
                 s.submitted, s.droppedNetwork, s.droppedBacklog, s.droppedEncoderBusy,
-                StreamStats.describe(s.captureDelays), StreamStats.describe(s.latencies))
+                Double(s.bytes) * 8 / 5 / 1_000_000,
+                StreamStats.describe(s.captureDelays), StreamStats.describe(s.copyTimes),
+                StreamStats.describe(s.encodeTimes),
+                StreamStats.describe(s.receiverTimes), StreamStats.describe(s.latencies))
+        if !s.changeToCapture.isEmpty {
+            lunaLog("luna-test: change->capture %@", StreamStats.describe(s.changeToCapture))
+        }
     }
 
     /// Needs both the virtual display and the receiver's caps; called when
@@ -436,6 +474,15 @@ final class SessionController {
             IOPMAssertionRelease(sleepAssertion)
             sleepAssertion = 0
         }
+        // The sleep assertion doesn't stop App Nap or timer coalescing, which
+        // slow every frame of a background (menu bar) app.
+        if prevent, latencyActivity == nil {
+            latencyActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiated, .latencyCritical], reason: "Luna is streaming a display")
+        } else if !prevent, let activity = latencyActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            latencyActivity = nil
+        }
     }
 }
 
@@ -447,10 +494,15 @@ struct StreamStats {
     var droppedEncoderBusy = 0
     var captureDelays: [Double] = []
     var latencies: [Double] = []
+    var encodeTimes: [Double] = []
+    var copyTimes: [Double] = []
+    var changeToCapture: [Double] = []
+    var receiverTimes: [Double] = []
+    var bytes = 0
 
     static func describe(_ seconds: [Double]) -> String {
         guard !seconds.isEmpty else { return "n/a" }
         let ms = seconds.map { $0 * 1000 }.sorted()
-        return String(format: "median %.0f ms, p90 %.0f ms", ms[ms.count / 2], ms[ms.count * 9 / 10])
+        return String(format: "median %.0f ms, p90 %.0f ms, max %.0f ms", ms[ms.count / 2], ms[ms.count * 9 / 10], ms.last!)
     }
 }

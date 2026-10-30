@@ -29,9 +29,19 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
     private let encodeQueue = DispatchQueue(label: "luna.encode", qos: .userInteractive)
     /// Newest captured frame not yet picked up by the encode queue.
     private let pendingLock = NSLock()
-    private var pendingFrame: (CVPixelBuffer, CMTime)?
+    /// With the strips that changed since the last encoded frame (bitmask).
+    private var pendingFrame: (CVPixelBuffer, CMTime, UInt8)?
+    private var sentFirstFrame = false
+    /// Menu bar changes (clock, the screen recording indicator, which pulses)
+    /// go out at most 10 times a second instead of forcing two full-height
+    /// strips into almost every frame. Capture queue only.
+    private var menuBarOwed: UInt8 = 0
+    private var lastMenuBarFlush: CFTimeInterval = 0
+    private var menuBarFlushScheduled = false
+    private var lastFrame: CVPixelBuffer?
+    private var skippedOwed: UInt8 = 0
     private var draining = false
-    private var tilePool: CVPixelBufferPool?
+    private lazy var splitter = StripSplitter()
 
     /// Called with wire-ready packets (paramSets / frame envelopes).
     var onPacket: ((Data) -> Void)?
@@ -44,6 +54,15 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Called when a captured frame is replaced by a newer one before the
     /// encoder got to it.
     var onFrameSkipped: (() -> Void)?
+    /// Called once every tile of a frame is encoded, with the seconds since
+    /// it was handed to the encoder.
+    var onFrameEncoded: ((Double) -> Void)?
+    /// Seconds to copy a strip out of the captured frame (5K only).
+    var onStripCopied: ((Double) -> Void)?
+    /// Test harness: seconds from the test window's last move to its capture.
+    var onChangeCaptured: ((Double) -> Void)?
+    private let encodeTimesLock = NSLock()
+    private var encodeStarts: [Int64: (start: CFTimeInterval, tilesLeft: Int, tiles: UInt8)] = [:]
     var onError: ((String) -> Void)?
 
     var framesSent: Int { encoders.first?.framesEncoded ?? 0 }
@@ -70,6 +89,10 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
             bitrate: config.bitrate / tiles, colorProperties: Self.colorProperties
         )
         encoderConfig.hevc = config.hevc
+        encoderConfig.tenBit = config.hevc
+        // TCP loses nothing, so keyframes are only a safety net; each one is
+        // a burst several times a normal frame.
+        encoderConfig.keyframeInterval = 10
         for tile in 0 ..< tiles {
             guard let encoder = VideoEncoder(config: encoderConfig) else {
                 onError?("Could not create the \(config.hevc ? "HEVC" : "H.264") encoder")
@@ -80,13 +103,17 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
                     self?.onPacket?(LunaWire.hevcParamSetsData(tile: tile, sets: sets))
                 }
                 encoder.onEncodedFrame = { [weak self] pts, keyframe, data in
-                    self?.onPacket?(LunaWire.hevcFrameData(tile: tile, ptsMicros: pts, keyframe: keyframe, data: data))
+                    guard let self else { return }
+                    let tiles = self.tilesSent(pts)
+                    self.tileEncoded(pts)
+                    self.onPacket?(LunaWire.hevcFrameData(tile: tile, tiles: tiles, ptsMicros: pts, keyframe: keyframe, data: data))
                 }
             } else {
                 encoder.onParameterSets = { [weak self] sets in
                     self?.onPacket?(LunaWire.paramSetsData(sps: sets[0], pps: sets[1]))
                 }
                 encoder.onEncodedFrame = { [weak self] pts, keyframe, avcc in
+                    self?.tileEncoded(pts)
                     self?.onPacket?(LunaWire.frameData(ptsMicros: pts, keyframe: keyframe, avcc: avcc))
                 }
             }
@@ -113,8 +140,10 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
         conf.width = config.streamWidth
         conf.height = config.streamHeight
         conf.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(config.fps))
-        // Full range P3 so the stream matches the color tags in colorProperties.
-        conf.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        // Full range P3; 10-bit for HEVC: 8 bits banded visibly in gradients
+        // once compressed (10-bit costs ~12% more encode time).
+        conf.pixelFormat = config.hevc
+            ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         conf.colorSpaceName = CGColorSpace.displayP3
         conf.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
         conf.showsCursor = config.showsCursor
@@ -169,17 +198,55 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
               !encoders.isEmpty
         else { return }
 
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if let since = TestProbe.sinceLastMove() { onChangeCaptured?(since) }
+        lastFrame = pixelBuffer
+        let dirty = changedStrips(attachments, width: CVPixelBufferGetWidth(pixelBuffer))
+        // Changes of a frame not sent (network backed up) are owed to the next.
+        var changed = dirty.content | skippedOwed
         if shouldDropFrame?() == true {
             framesDropped += 1
+            skippedOwed = changed | dirty.menuBar
             return
         }
-        // Never make ScreenCaptureKit wait: an encode call blocks for the
-        // whole encode, and while this callback runs SCK queues new frames,
-        // each then arriving that much later. Hand over the newest frame and
-        // return; the encode queue always takes the newest one waiting.
+        skippedOwed = 0
+        menuBarOwed |= dirty.menuBar & ~changed
+        let now = CACurrentMediaTime()
+        if menuBarOwed != 0, now - lastMenuBarFlush >= 0.1 {
+            changed |= menuBarOwed
+            menuBarOwed = 0
+            lastMenuBarFlush = now
+        } else if menuBarOwed != 0, !menuBarFlushScheduled {
+            // Nothing else may change for a while; don't strand the update.
+            menuBarFlushScheduled = true
+            captureQueue.asyncAfter(deadline: .now() + 0.1) { [weak self] in self?.flushMenuBar() }
+        }
+        guard changed != 0 else { return }
+        submit(pixelBuffer, pts: pts, changed: changed)
+    }
+
+    /// Capture queue: sends menu bar changes still owed, on the latest frame.
+    private func flushMenuBar() {
+        menuBarFlushScheduled = false
+        guard menuBarOwed != 0, let pixelBuffer = lastFrame else { return }
+        let changed = menuBarOwed
+        menuBarOwed = 0
+        lastMenuBarFlush = CACurrentMediaTime()
+        // A fresh timestamp: the encoders need them strictly increasing.
+        submit(pixelBuffer, pts: CMClockGetTime(CMClockGetHostTimeClock()), changed: changed)
+    }
+
+    /// Capture queue. Never makes ScreenCaptureKit wait: an encode call
+    /// blocks for the whole encode, and while the capture callback runs SCK
+    /// queues new frames, each then arriving that much later. Hands over the
+    /// newest frame and returns; the encode queue takes the newest one waiting.
+    private func submit(_ pixelBuffer: CVPixelBuffer, pts: CMTime, changed: UInt8) {
+        var changed = changed
         pendingLock.lock()
         let replaced = pendingFrame != nil
-        pendingFrame = (pixelBuffer, CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        // A frame replaced before it was encoded still owes its changes.
+        changed |= pendingFrame?.2 ?? 0
+        pendingFrame = (pixelBuffer, pts, changed)
         let startDraining = !draining
         draining = true
         pendingLock.unlock()
@@ -193,78 +260,95 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
     private func drainPendingFrames() {
         while true {
             pendingLock.lock()
-            guard let (pixelBuffer, pts) = pendingFrame else {
+            guard let (pixelBuffer, pts, changed) = pendingFrame else {
                 draining = false
                 pendingLock.unlock()
                 return
             }
             pendingFrame = nil
             pendingLock.unlock()
-            encode(pixelBuffer, pts: pts)
+            encode(pixelBuffer, pts: pts, changed: changed)
         }
     }
 
-    private func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
+    /// Bitmasks of the strips ScreenCaptureKit reports dirty in this frame:
+    /// by changes below the menu bar, and by changes within it.
+    private func changedStrips(_ attachments: [String: Any], width: Int) -> (content: UInt8, menuBar: UInt8) {
+        let count = encoders.count
+        let all = UInt8(truncatingIfNeeded: (1 << count) - 1)
+        guard count > 1,
+              let rects = attachments[SCStreamFrameInfo.dirtyRects.rawValue] as? [NSDictionary]
+        else { return (all, 0) }
+        let stripWidth = CGFloat(width) / CGFloat(count)
+        // Pixels from the top; the 5K Retina menu bar is ~74 px tall.
+        let menuBarBottom: CGFloat = 80
+        var content: UInt8 = 0
+        var menuBar: UInt8 = 0
+        for dict in rects {
+            guard let rect = CGRect(dictionaryRepresentation: dict as CFDictionary), !rect.isEmpty else { continue }
+            let first = max(0, min(count - 1, Int(rect.minX / stripWidth)))
+            let last = max(0, min(count - 1, Int((rect.maxX - 1) / stripWidth)))
+            for strip in first ... last {
+                if rect.maxY <= menuBarBottom { menuBar |= 1 << strip } else { content |= 1 << strip }
+            }
+        }
+        return (content, menuBar)
+    }
+
+    private func tilesSent(_ pts: Int64) -> UInt8 {
+        encodeTimesLock.lock()
+        defer { encodeTimesLock.unlock() }
+        return encodeStarts[pts]?.tiles ?? 0
+    }
+
+    private func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, changed: UInt8) {
         let encoders = encoders
         guard !encoders.isEmpty else { return }
+        // The receiver has nothing yet: the first frame carries every strip.
+        let tiles = sentFirstFrame ? changed : UInt8(truncatingIfNeeded: (1 << encoders.count) - 1)
+        sentFirstFrame = true
+        let indices = encoders.indices.filter { tiles & (1 << $0) != 0 }
         // Same rounding as VideoEncoder's ptsMicros, so acks match.
-        onFrameSubmitted?(Int64(CMTimeGetSeconds(pts) * 1_000_000))
+        let ptsMicros = Int64(CMTimeGetSeconds(pts) * 1_000_000)
+        onFrameSubmitted?(ptsMicros)
+        encodeTimesLock.lock()
+        encodeStarts[ptsMicros] = (CACurrentMediaTime(), indices.count, tiles)
+        encodeTimesLock.unlock()
         if encoders.count == 1 {
             encoders[0].encode(pixelBuffer, pts: pts)
             return
         }
-        // Both halves at once; one after the other they would take twice as long.
-        makeTilePool(for: pixelBuffer, count: encoders.count)
-        DispatchQueue.concurrentPerform(iterations: encoders.count) { index in
-            guard let strip = copyStrip(pixelBuffer, index: index, count: encoders.count) else { return }
-            encoders[index].encode(strip, pts: pts)
+        let splitStart = CACurrentMediaTime()
+        guard let strips = splitter?.split(pixelBuffer, strips: indices, of: encoders.count) else { return }
+        onStripCopied?(CACurrentMediaTime() - splitStart)
+        // Only changed strips are encoded: the encoder's time scales with the
+        // pixels (5K: ~4 ms per strip of four, ~16 ms for all). Wait until
+        // they are out before taking the next frame. At 5K60 the encoder is
+        // near its limit; frames handed over freely queued up inside it and
+        // every frame then waited ~43 ms instead of ~20. drainPendingFrames
+        // meanwhile keeps only the newest capture.
+        DispatchQueue.concurrentPerform(iterations: indices.count) { n in
+            let encoder = encoders[indices[n]]
+            encoder.encode(strips[n], pts: pts)
+            encoder.waitForFrames(through: pts)
         }
     }
 
-    /// Encode queue, before the strips are copied in parallel.
-    private func makeTilePool(for source: CVPixelBuffer, count: Int) {
-        guard tilePool == nil else { return }
-        let width = CVPixelBufferGetWidth(source) / count
-        let height = CVPixelBufferGetHeight(source)
-        do {
-            let attributes: [CFString: Any] = [
-                kCVPixelBufferPixelFormatTypeKey: CVPixelBufferGetPixelFormatType(source),
-                kCVPixelBufferWidthKey: width,
-                kCVPixelBufferHeightKey: height,
-                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
-            ]
-            CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &tilePool)
+    /// Encoder callback threads.
+    private func tileEncoded(_ pts: Int64) {
+        encodeTimesLock.lock()
+        guard let entry = encodeStarts[pts] else {
+            encodeTimesLock.unlock()
+            return
         }
-    }
-
-    /// Copies one vertical strip of a bi-planar 4:2:0 frame into a pooled
-    /// buffer. ponytail: CPU copy, about 2 ms per 5K frame on Apple Silicon;
-    /// a VTPixelTransferSession crop would move it to the GPU if that matters.
-    private func copyStrip(_ source: CVPixelBuffer, index: Int, count: Int) -> CVPixelBuffer? {
-        let width = CVPixelBufferGetWidth(source) / count
-        var strip: CVPixelBuffer?
-        guard let tilePool, CVPixelBufferPoolCreatePixelBuffer(nil, tilePool, &strip) == kCVReturnSuccess,
-              let strip
-        else { return nil }
-        CVPixelBufferLockBaseAddress(source, .readOnly)
-        CVPixelBufferLockBaseAddress(strip, [])
-        defer {
-            CVPixelBufferUnlockBaseAddress(strip, [])
-            CVPixelBufferUnlockBaseAddress(source, .readOnly)
+        if entry.tilesLeft > 1 {
+            encodeStarts[pts] = (entry.start, entry.tilesLeft - 1, entry.tiles)
+            encodeTimesLock.unlock()
+            return
         }
-        for plane in 0 ..< CVPixelBufferGetPlaneCount(source) {
-            // Both planes are one byte per luma column: Y, then interleaved CbCr at half height.
-            guard let from = CVPixelBufferGetBaseAddressOfPlane(source, plane),
-                  let to = CVPixelBufferGetBaseAddressOfPlane(strip, plane)
-            else { return nil }
-            let fromStride = CVPixelBufferGetBytesPerRowOfPlane(source, plane)
-            let toStride = CVPixelBufferGetBytesPerRowOfPlane(strip, plane)
-            for row in 0 ..< CVPixelBufferGetHeightOfPlane(strip, plane) {
-                memcpy(to + row * toStride, from + row * fromStride + index * width, width)
-            }
-        }
-        CVBufferPropagateAttachments(source, strip)
-        return strip
+        encodeStarts = encodeStarts.filter { $0.key > pts }
+        encodeTimesLock.unlock()
+        onFrameEncoded?(CACurrentMediaTime() - entry.start)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {

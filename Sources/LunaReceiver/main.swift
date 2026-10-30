@@ -103,11 +103,12 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
     private var sawParameterSets = false
     /// Tiles decoded per frame timestamp; the frame is acked once all are in.
     private let ackLock = NSLock()
-    private var tilesDecoded: [Int64: Int] = [:]
+    private var tilesDecoded: [Int64: (count: Int, slowest: Double)] = [:]
     private let server = ReceiverServer()
     private let statusField = NSTextField(labelWithString: "Starting…")
     private var listeningText = "starting…"
     private var sleepAssertion: IOPMAssertionID = 0
+    private var latencyActivity: NSObjectProtocol?
     private var keyMonitor: Any?
     private var isStreaming = false
     private var cursorHidden = false
@@ -357,9 +358,9 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
             parameterSetsArrived()
         case .frame(let pts, _, let data):
             pipelines.first?.enqueue(ptsMicros: pts, data: data)
-        case .hevcFrame(let tile, let pts, _, let data):
+        case .hevcFrame(let tile, let tiles, let pts, _, let data):
             guard pipelines.indices.contains(tile) else { return }
-            pipelines[tile].enqueue(ptsMicros: pts, data: data)
+            pipelines[tile].enqueue(ptsMicros: pts, data: data, tiles: tiles.nonzeroBitCount)
         default:
             break
         }
@@ -373,25 +374,34 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func makePipelines(count: Int) -> [VideoPipeline] {
-        (0 ..< count).map { _ in
-            let pipeline = VideoPipeline()
-            pipeline.onDecoded = { [weak self] pts in self?.tileDecoded(pts: pts, tiles: count) }
+        let sync = TileSync()
+        return (0 ..< count).map { tile in
+            let pipeline = VideoPipeline(tile: tile, sync: sync)
+            pipeline.onDecoded = { [weak self] pts, duration, tiles in
+                self?.tileDecoded(pts: pts, duration: duration, tiles: tiles)
+            }
             return pipeline
         }
     }
 
     /// Decoder threads. Tells the sender once every tile of a frame is decoded.
-    private func tileDecoded(pts: Int64, tiles: Int) {
+    private func tileDecoded(pts: Int64, duration: Double, tiles: Int) {
         ackLock.lock()
-        let count = (tilesDecoded[pts] ?? 0) + 1
-        if count == tiles {
-            // Tiles of older frames that never completed won't any more.
-            tilesDecoded = tilesDecoded.filter { $0.key > pts }
+        let previous = tilesDecoded[pts] ?? (0, 0)
+        let count = previous.count + 1
+        let slowest = max(previous.slowest, duration)
+        if count >= tiles {
+            // Older frames may still complete (partial frames overlap); only
+            // forget ones a second old.
+            tilesDecoded[pts] = nil
+            tilesDecoded = tilesDecoded.filter { $0.key > pts - 1_000_000 }
         } else {
-            tilesDecoded[pts] = count
+            tilesDecoded[pts] = (count, slowest)
         }
         ackLock.unlock()
-        if count == tiles { server.send(LunaWire.frameAckData(ptsMicros: pts)) }
+        if count >= tiles {
+            server.send(LunaWire.frameAckData(ptsMicros: pts, receiverMicros: Int(slowest * 1_000_000)))
+        }
     }
 
     private func showWaiting() {
@@ -443,6 +453,15 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
         } else if !prevent, sleepAssertion != 0 {
             IOPMAssertionRelease(sleepAssertion)
             sleepAssertion = 0
+        }
+        // The sleep assertion doesn't stop App Nap or timer coalescing, which
+        // slow every frame of a background (menu bar) app.
+        if prevent, latencyActivity == nil {
+            latencyActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiated, .latencyCritical], reason: "Luna is receiving a display stream")
+        } else if !prevent, let activity = latencyActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            latencyActivity = nil
         }
     }
 }

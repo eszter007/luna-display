@@ -16,6 +16,8 @@ public final class VideoEncoder {
         public var bitrate: Int
         /// HEVC instead of H.264.
         public var hevc = false
+        /// HEVC Main10 from 10-bit 4:2:0 input: smooth gradients without banding.
+        public var tenBit = false
         /// Seconds between forced keyframes.
         public var keyframeInterval = 2
         /// Color tags (ColorPrimaries, TransferFunction, YCbCrMatrix) for the VUI.
@@ -94,7 +96,8 @@ public final class VideoEncoder {
         set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
         set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
         set(kVTCompressionPropertyKey_ProfileLevel,
-            config.hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel)
+            !config.hevc ? kVTProfileLevel_H264_High_AutoLevel
+                : config.tenBit ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel)
         set(kVTCompressionPropertyKey_AverageBitRate, config.bitrate as CFNumber)
         set(kVTCompressionPropertyKey_ExpectedFrameRate, config.fps as CFNumber)
         set(kVTCompressionPropertyKey_MaxKeyFrameInterval, (config.fps * config.keyframeInterval) as CFNumber)
@@ -132,6 +135,12 @@ public final class VideoEncoder {
             guard let self, status == noErr, let encoded else { return }
             self.emit(encoded)
         }
+    }
+
+    /// Blocks until every frame up to `pts` has come out of the encoder.
+    public func waitForFrames(through pts: CMTime) {
+        guard let session else { return }
+        VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: pts)
     }
 
     public func invalidate() {

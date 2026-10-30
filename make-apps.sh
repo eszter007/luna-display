@@ -15,8 +15,11 @@ rm -rf dist
 mkdir -p dist
 
 # --- Signing identity -------------------------------------------------------
-IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
-  | awk -F'"' '/Developer ID Application/{print $2; exit}')
+# LUNA_SIGN_IDENTITY overrides, e.g. an "Apple Development" certificate's
+# hash: a stable signature keeps the Screen Recording grant across rebuilds,
+# which ad-hoc signing loses every time.
+IDENTITY=${LUNA_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null \
+  | awk -F'"' '/Developer ID Application/{print $2; exit}')}
 if [ -n "$IDENTITY" ]; then
   echo "Signing as: $IDENTITY"
 else

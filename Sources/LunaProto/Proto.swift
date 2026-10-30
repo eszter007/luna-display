@@ -7,19 +7,20 @@
 //   paramSets    (3): [spsLen: u16 LE][sps][ppsLen: u16 LE][pps]
 //   frame        (4): [ptsMicros: i64 LE][flags: u8][AVCC data]   flags bit 0 = keyframe
 //   hevcParamSets(12): [tile: u8][count: u8] then count x [len: u16 LE][VPS/SPS/PPS]
-//   hevcFrame   (13): [tile: u8][frame payload]
+//   hevcFrame   (13): [tile: u8][tiles: u8 bitmask of all tiles sent for this frame][frame payload]
 //
 // HEVC streams come in hello.tiles vertical strips of the w x h picture, each
-// its own stream (tile 0 leftmost). The sender's encoder works on the strips
-// in parallel, which halves the per-frame encode time at 5K.
+// its own stream (tile 0 leftmost). Only strips that changed are sent for a
+// frame; encode time scales with them (5K: ~4 ms per strip of four).
 //
 // Receiver -> sender:
-//   caps         (2): JSON {v, maxW, maxH, name, cam, mic, cursor, hevcTiles}
+//   caps         (2): JSON {v, maxW, maxH, name, cam, mic, cursor, hevcStrips}
 //   camParamSets (5): same layout as paramSets
 //   camFrame     (6): same layout as frame
 //   audio        (7): [ptsMicros: i64 LE][sampleRate: u32 LE][channels: u8][PCM s16 LE interleaved]
 //   captureStatus(9): JSON {cam, mic} — strings: "off", "streaming", "denied", "none", "error: …"
-//   frameAck    (14): [ptsMicros: i64 LE] — every tile of that frame is decoded.
+//   frameAck    (14): [ptsMicros: i64 LE][receiverMicros: u32 LE] — every tile of
+//                     that frame is decoded; receiverMicros is arrival -> decoded.
 //                     Once acks arrive, the sender caps the frames in flight
 //                     so no queue builds up anywhere between capture and decode.
 //
@@ -29,7 +30,7 @@
 //                     hot spot as a fraction of the image, size as a fraction of the display
 //   cursorPos   (11): [x: f32][y: f32][visible: u8] — hot spot as a fraction of the display, top-left origin
 //
-// Receivers that set caps.hevcTiles hardware-decode HEVC, which carries a full
+// Receivers that set caps.hevcStrips hardware-decode HEVC, which carries a full
 // 5120x2880 frame; H.264 tops out around 4K on the iMacs' decoders.
 //
 // Receivers that set caps.cursor draw the cursor themselves from cursorImage/
@@ -50,8 +51,9 @@ public enum LunaMessage: Equatable {
     case cursorImage(hotX: Float, hotY: Float, width: Float, height: Float, png: Data)
     case cursorPos(x: Float, y: Float, visible: Bool)
     case hevcParamSets(tile: Int, sets: [Data])
-    case hevcFrame(tile: Int, ptsMicros: Int64, keyframe: Bool, data: Data)
-    case frameAck(ptsMicros: Int64)
+    /// `tiles`: bitmask of every tile sent for this frame (unchanged tiles are skipped).
+    case hevcFrame(tile: Int, tiles: UInt8, ptsMicros: Int64, keyframe: Bool, data: Data)
+    case frameAck(ptsMicros: Int64, receiverMicros: Int)
 
     /// High-rate media flowing back from the receiver (camera frames, audio).
     public var isReverseMedia: Bool {
@@ -118,7 +120,7 @@ public enum LunaWire {
     public static func capsData(screenWidth: Int, screenHeight: Int, name: String, hasCamera: Bool, hasMic: Bool, drawsCursor: Bool = false, decodesHEVC: Bool = false) -> Data {
         envelope(type: typeCaps, payload: json([
             "v": 2, "maxW": screenWidth, "maxH": screenHeight, "name": name, "cam": hasCamera, "mic": hasMic,
-            "cursor": drawsCursor, "hevcTiles": decodesHEVC,
+            "cursor": drawsCursor, "hevcStrips": decodesHEVC,
         ]))
     }
 
@@ -131,14 +133,15 @@ public enum LunaWire {
         return envelope(type: typeHEVCParamSets, payload: p)
     }
 
-    public static func frameAckData(ptsMicros: Int64) -> Data {
-        var p = Data(capacity: 8)
+    public static func frameAckData(ptsMicros: Int64, receiverMicros: Int) -> Data {
+        var p = Data(capacity: 12)
         appendU64LE(&p, UInt64(bitPattern: ptsMicros))
+        appendU32LE(&p, UInt32(clamping: max(receiverMicros, 0)))
         return envelope(type: typeFrameAck, payload: p)
     }
 
-    public static func hevcFrameData(tile: Int, ptsMicros: Int64, keyframe: Bool, data: Data) -> Data {
-        envelope(type: typeHEVCFrame, payload: Data([UInt8(tile)]) + framePayload(ptsMicros: ptsMicros, keyframe: keyframe, avcc: data))
+    public static func hevcFrameData(tile: Int, tiles: UInt8, ptsMicros: Int64, keyframe: Bool, data: Data) -> Data {
+        envelope(type: typeHEVCFrame, payload: Data([UInt8(tile), tiles]) + framePayload(ptsMicros: ptsMicros, keyframe: keyframe, avcc: data))
     }
 
     static func appendF32LE(_ d: inout Data, _ v: Float) {
@@ -230,21 +233,29 @@ public final class LunaMessageParser {
         guard !corrupted else { return [] }
         buffer.append(data)
         var out: [LunaMessage] = []
+        // Walk the messages by offset and drop the consumed bytes once at the
+        // end: removing each message from the front re-copied the rest of a
+        // read of up to 1 MB per message, which on the receiving iMac slowed
+        // reading enough to back the stream up on the sender.
+        var offset = 0
         while true {
-            guard buffer.count >= 5 else { break }
-            let type = byte(at: 0)
-            let length = Int(u32LE(at: 1))
+            guard buffer.count - offset >= 5 else { break }
+            let type = byte(at: offset)
+            let length = Int(u32LE(at: offset + 1))
             guard length <= Self.maxPayloadLength else {
                 corrupted = true
                 buffer.removeAll()
-                break
+                return out
             }
-            guard buffer.count >= 5 + length else { break }
-            let payload = buffer.subdata(in: index(5) ..< index(5 + length))
-            buffer.removeSubrange(buffer.startIndex ..< index(5 + length))
+            guard buffer.count - offset >= 5 + length else { break }
+            let payload = buffer.subdata(in: index(offset + 5) ..< index(offset + 5 + length))
+            offset += 5 + length
             if let msg = Self.decode(type: type, payload: payload) {
                 out.append(msg)
             }
+        }
+        if offset > 0 {
+            buffer.removeSubrange(buffer.startIndex ..< index(offset))
         }
         return out
     }
@@ -317,9 +328,9 @@ public final class LunaMessageParser {
                 hasCamera: dict["cam"] as? Bool ?? false,
                 hasMic: dict["mic"] as? Bool ?? false,
                 drawsCursor: dict["cursor"] as? Bool ?? false,
-                // Was "hevc" for the single-stream format; an old receiver reporting
+                // Was "hevc", then "hevcTiles" for older stream formats; a receiver reporting
                 // that must get H.264, not tiles it can't read.
-                decodesHEVC: dict["hevcTiles"] as? Bool ?? false
+                decodesHEVC: dict["hevcStrips"] as? Bool ?? false
             )
         case LunaWire.typeParamSets:
             guard let ps = parameterSets(payload) else { return nil }
@@ -362,10 +373,14 @@ public final class LunaMessageParser {
             return .hevcParamSets(tile: Int(bytes[0]), sets: sets)
         case LunaWire.typeFrameAck:
             guard payload.count >= 8 else { return nil }
-            return .frameAck(ptsMicros: i64LE([UInt8](payload.prefix(8)), at: 0))
+            let bytes = [UInt8](payload.prefix(12))
+            let receiverMicros = bytes.count >= 12
+                ? Int(bytes[8]) | Int(bytes[9]) << 8 | Int(bytes[10]) << 16 | Int(bytes[11]) << 24 : 0
+            return .frameAck(ptsMicros: i64LE(bytes, at: 0), receiverMicros: receiverMicros)
         case LunaWire.typeHEVCFrame:
-            guard let tile = payload.first, let f = frame(payload.dropFirst()) else { return nil }
-            return .hevcFrame(tile: Int(tile), ptsMicros: f.ptsMicros, keyframe: f.keyframe, data: f.data)
+            guard payload.count >= 2, let f = frame(payload.dropFirst(2)) else { return nil }
+            let head = [UInt8](payload.prefix(2))
+            return .hevcFrame(tile: Int(head[0]), tiles: head[1], ptsMicros: f.ptsMicros, keyframe: f.keyframe, data: f.data)
         case LunaWire.typeCursorImage:
             guard payload.count >= 16 else { return nil }
             let bytes = [UInt8](payload.prefix(16))

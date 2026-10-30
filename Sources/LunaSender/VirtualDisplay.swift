@@ -82,6 +82,16 @@ final class VirtualDisplaySession {
         display = d
         displayID = d.displayID
         selectMode(pointWidth: targetPointWidth, pixelWidth: targetPixelWidth)
+        // WindowServer restores a remembered mode for the display a moment
+        // after it appears (seen: 3200x1800 points, tiny UI and 6400x3600
+        // pixels to render and scale down every frame). Assert ours again.
+        let id = displayID
+        for delay in [0.3, 1.0, 2.5] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.displayID == id else { return }
+                self.selectMode(pointWidth: targetPointWidth, pixelWidth: targetPixelWidth)
+            }
+        }
         lunaLog("luna: virtual display created, id=%u %ux%u hiDPI=%u", displayID, pixelWidth, pixelHeight, hiDPIValue)
         return true
     }
@@ -100,6 +110,7 @@ final class VirtualDisplaySession {
         guard let target, target.pixelWidth != CGDisplayCopyDisplayMode(displayID)?.pixelWidth
             || target.width != CGDisplayCopyDisplayMode(displayID)?.width
         else { return }
+        lunaLog("luna: switching virtual display to %dx%d points", target.width, target.height)
         var config: CGDisplayConfigRef?
         guard CGBeginDisplayConfiguration(&config) == .success, let config else { return }
         CGConfigureDisplayWithDisplayMode(config, displayID, target, nil)

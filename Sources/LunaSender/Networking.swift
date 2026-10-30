@@ -118,7 +118,7 @@ final class SenderConnection {
     var onMessage: ((LunaMessage) -> Void)?  // main queue
     /// Frame acks, called right on the network queue: they arrive 60 times a
     /// second and feed the frame pacing, so they skip the main-queue hop.
-    var onFrameAck: ((Int64) -> Void)?
+    var onFrameAck: ((_ ptsMicros: Int64, _ receiverMicros: Int) -> Void)?
 
     private var closed = false
     private let wiredOnly: Bool
@@ -189,8 +189,8 @@ final class SenderConnection {
             guard let self else { return }
             if let data, !data.isEmpty {
                 for msg in self.parser.feed(data) {
-                    if case .frameAck(let pts) = msg {
-                        self.onFrameAck?(pts)
+                    if case .frameAck(let pts, let receiverMicros) = msg {
+                        self.onFrameAck?(pts, receiverMicros)
                     } else {
                         DispatchQueue.main.async { self.onMessage?(msg) }
                     }

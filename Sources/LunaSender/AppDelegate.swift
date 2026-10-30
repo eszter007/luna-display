@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 import Network
 import LunaProto
 
@@ -250,11 +251,14 @@ extension SenderAppDelegate {
         guard let idx = CommandLine.arguments.firstIndex(of: "--test-disconnect"),
               CommandLine.arguments.indices.contains(idx + 1) else { return }
         let address = CommandLine.arguments[idx + 1]
-        let parts = address.split(separator: ":")
-        guard parts.count == 2, let port = NWEndpoint.Port(String(parts[1])) else {
+        // host:port, split at the last colon so scoped IPv6 hosts work
+        // (e.g. fe80::1%bridge0:52525, to test over a Thunderbolt bridge).
+        guard let colon = address.lastIndex(of: ":"),
+              let port = NWEndpoint.Port(String(address[address.index(after: colon)...])) else {
             testLog("bad address \(address)")
             exit(2)
         }
+        let host = String(address[..<colon])
         let existing = session.onStateChange
         session.onStateChange = { [weak self] state in
             existing?(state)
@@ -262,7 +266,7 @@ extension SenderAppDelegate {
         }
         testLog("connecting to \(address)")
         session.connect(
-            endpoint: .hostPort(host: NWEndpoint.Host(String(parts[0])), port: port),
+            endpoint: .hostPort(host: NWEndpoint.Host(host), port: port),
             name: "test"
         )
         pollForStreaming(deadline: Date().addingTimeInterval(30))
@@ -298,20 +302,97 @@ extension SenderAppDelegate {
         guard let screen = NSScreen.screens.first(where: {
             ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == displayID
         }) else { return nil }
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+        let mode = ProcessInfo.processInfo.environment["LUNA_TEST_ANIMATE"] ?? ""
+        if mode == "flip" || mode == "scroll" { return startFullScreenTest(on: screen, flip: mode == "flip") }
+        // "wild": a big window full of colored text, flung around fast.
+        let wild = mode == "wild"
+        let size = wild ? NSSize(width: 1600, height: 1000) : NSSize(width: 900, height: 600)
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                               styleMask: [.titled], backing: .buffered, defer: false, screen: screen)
         window.isReleasedWhenClosed = false
         window.backgroundColor = .systemTeal
+        if wild {
+            let text = NSTextView(frame: NSRect(origin: .zero, size: size))
+            let line = "The quick brown fox jumps over the lazy dog 0123456789 — Luna 5K stream test. "
+            let content = NSMutableAttributedString()
+            for i in 0 ..< 80 {
+                content.append(NSAttributedString(string: String(repeating: line, count: 3) + "\n", attributes: [
+                    .foregroundColor: NSColor(hue: CGFloat(i % 12) / 12, saturation: 0.8, brightness: 0.7, alpha: 1),
+                    .font: NSFont.systemFont(ofSize: 13),
+                ]))
+            }
+            text.textStorage?.setAttributedString(content)
+            window.contentView = text
+        }
         window.orderFrontRegardless()
         var step = 0.0
-        return Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { timer in
-            step += 1
+        let speed = wild ? 4.0 : 1.0
+        // LUNA_TEST_HZ: move rate, e.g. 4 for the occasional updates of real use.
+        let hz = Double(ProcessInfo.processInfo.environment["LUNA_TEST_HZ"] ?? "") ?? 60
+        var moves = 0
+        var lastReport = CACurrentMediaTime()
+        let timer = Timer(timeInterval: 1.0 / hz, repeats: true) { timer in
+            step += speed
+            moves += 1
+            if CACurrentMediaTime() - lastReport >= 5 {
+                lunaLog("luna-test: test window moved %d times in 5 s", moves)
+                moves = 0
+                lastReport = CACurrentMediaTime()
+            }
             let frame = screen.frame
-            let x = frame.minX + (frame.width - 900) * (0.5 + 0.5 * sin(step / 40))
-            let y = frame.minY + (frame.height - 600) * (0.5 + 0.5 * cos(step / 55))
+            let x = frame.minX + (frame.width - size.width) * (0.5 + 0.5 * sin(step / 40))
+            let y = frame.minY + (frame.height - size.height) * (0.5 + 0.5 * cos(step / 55))
             window.setFrameOrigin(NSPoint(x: x, y: y))
+            TestProbe.moved()
             if !timer.isValid { window.close() }
         }
+        timer.tolerance = 0
+        RunLoop.main.add(timer, forMode: .common)
+        return timer
+    }
+
+    /// "flip": twice a second the whole screen switches between colored text
+    /// and smooth gradients, like switching apps or Spaces. "scroll": the
+    /// text scrolls continuously, every pixel changes every frame.
+    private static func startFullScreenTest(on screen: NSScreen, flip: Bool) -> Timer {
+        let window = NSWindow(contentRect: screen.frame, styleMask: [.borderless],
+                              backing: .buffered, defer: false, screen: screen)
+        window.isReleasedWhenClosed = false
+        window.level = .statusBar
+        let scroll = NSScrollView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        let text = NSTextView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        let line = "The quick brown fox jumps over the lazy dog 0123456789 — Luna 5K stream test. "
+        let content = NSMutableAttributedString()
+        for i in 0 ..< 400 {
+            content.append(NSAttributedString(string: String(repeating: line, count: 6) + "\n", attributes: [
+                .foregroundColor: NSColor(hue: CGFloat(i % 12) / 12, saturation: 0.8, brightness: 0.7, alpha: 1),
+                .font: NSFont.systemFont(ofSize: 13),
+            ]))
+        }
+        text.textStorage?.setAttributedString(content)
+        scroll.documentView = text
+        let gradient = GradientTestView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        let container = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        container.addSubview(scroll)
+        container.addSubview(gradient)
+        window.contentView = container
+        window.orderFrontRegardless()
+        var tick = 0
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { timer in
+            tick += 1
+            if flip {
+                guard tick % 30 == 0 else { return }
+                gradient.isHidden.toggle()
+            } else {
+                gradient.isHidden = true
+                text.scroll(NSPoint(x: 0, y: CGFloat(tick * 6 % 6000)))
+            }
+            TestProbe.moved()
+            if !timer.isValid { window.close() }
+        }
+        timer.tolerance = 0
+        RunLoop.main.add(timer, forMode: .common)
+        return timer
     }
 
     private func verifyTeardown(displayID: CGDirectDisplayID) {
@@ -328,3 +409,33 @@ extension SenderAppDelegate {
         exit(1)
     }
 }
+
+/// Test harness only: when the test window last moved, so the capture side
+/// can measure change -> captured (WindowServer compositing + ScreenCaptureKit).
+enum TestProbe {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var lastMove: CFTimeInterval = 0
+
+    static func moved() {
+        lock.lock()
+        lastMove = CACurrentMediaTime()
+        lock.unlock()
+    }
+
+    /// Seconds since the last move, or nil outside the animated test.
+    static func sinceLastMove() -> Double? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastMove == 0 ? nil : CACurrentMediaTime() - lastMove
+    }
+}
+
+/// Test harness: smooth full-screen gradients, where banding shows first.
+final class GradientTestView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        NSGradient(colors: [.systemIndigo, .systemTeal, .systemOrange])?.draw(in: bounds, angle: 30)
+        NSGradient(starting: NSColor(white: 0.05, alpha: 1), ending: NSColor(white: 0.25, alpha: 1))?
+            .draw(in: NSRect(x: 0, y: 0, width: bounds.width, height: bounds.height / 4), angle: 0)
+    }
+}
+

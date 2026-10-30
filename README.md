@@ -28,13 +28,14 @@ launch, then jump to [Setup](#setup). Building from source is optional.
    commercial tools use. No dongle needed.
 2. ScreenCaptureKit captures it at 60 fps and the hardware encoder
    compresses it. When the receiver can hardware-decode HEVC (e.g. the
-   2020 iMac) the full 5120×2880 frame goes out as HEVC at 120 Mbit/s,
-   split into two 2560×2880 halves that the encoder works on in parallel
-   (one 5K stream takes ~27 ms per frame on an M5 Pro, two halves ~14 ms);
-   otherwise it falls back to H.264 at 3840×2160.
+   2020 iMac) the full 5120×2880 frame goes out as HEVC in four
+   1280×2880 strips, and only the strips that changed are encoded (one
+   strip ~4 ms, all four ~16 ms on an M5 Pro); otherwise it falls back to
+   H.264 at 3840×2160.
 3. **LunaReceiver** (the iMac, fullscreen app) advertises itself over
-   Bonjour, receives the stream over TCP, and feeds compressed samples
-   straight into `AVSampleBufferDisplayLayer` for hardware decode.
+   Bonjour, receives the stream over TCP, hardware-decodes it and shows
+   the strips of each frame together. It acks every frame; the sender logs
+   frame rate and capture → decoded latency every 5 s.
 
 Why the 4K fallback? A 2014/2015-era iMac can only H.264-decode up to ~4K.
 Rendering the UI at 5K, downscaling to 4K for transport, and upscaling back
