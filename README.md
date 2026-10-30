@@ -26,16 +26,18 @@ launch, then jump to [Setup](#setup). Building from source is optional.
    a *true Retina 5K virtual display* — 2560×1440 points backed by
    5120×2880 pixels — using the same private CoreGraphics API the
    commercial tools use. No dongle needed.
-2. ScreenCaptureKit captures it at 60 fps; the hardware encoder compresses
-   to low-latency H.264 at a 3840×2160 stream size.
+2. ScreenCaptureKit captures it at 60 fps and the hardware encoder
+   compresses it. When the receiver can hardware-decode HEVC (e.g. the
+   2020 iMac) the full 5120×2880 frame goes out as HEVC at 120 Mbit/s;
+   otherwise it falls back to H.264 at 3840×2160.
 3. **LunaReceiver** (the iMac, fullscreen app) advertises itself over
    Bonjour, receives the stream over TCP, and feeds compressed samples
    straight into `AVSampleBufferDisplayLayer` for hardware decode.
 
-Why 4K on the wire when the display is 5K? A 2014/2015-era iMac can only
-H.264-decode up to ~4K. Rendering the UI at 5K, downscaling to 4K for
-transport, and upscaling back to the panel is the same trick macOS "scaled"
-resolutions use — text stays much sharper than a non-Retina stream.
+Why the 4K fallback? A 2014/2015-era iMac can only H.264-decode up to ~4K.
+Rendering the UI at 5K, downscaling to 4K for transport, and upscaling back
+to the panel is the same trick macOS "scaled" resolutions use: sharper than
+a non-Retina stream, but visibly softer than true 5K.
 
 ## Requirements
 
@@ -116,8 +118,8 @@ again or Esc returns to fullscreen; nothing changes unless you ask for it.
 
 ## Roadmap
 
-- True 5K on the wire: tile the frame into 2–4 independent H.264 streams,
-  each within the iMac's decoder limits, reassembled in a Metal layer.
+- True 5K for iMacs without HEVC decode: tile the frame into independent
+  H.264 streams, each within the decoder's limits.
 - Adaptive bitrate from send-queue depth.
 - Clipboard sync.
 

@@ -78,6 +78,14 @@ final class SessionController {
     private var cursorTracker: CursorTracker?
     /// The receiver said (in caps) it draws the cursor from cursorPos messages.
     private var receiverDrawsCursor = false
+    /// The receiver said (in caps) it hardware-decodes HEVC.
+    private var receiverDecodesHEVC = false
+
+    /// HEVC carries the full 5K frame. H.264 stays at 4K, the most the
+    /// iMacs' H.264 decoders take.
+    private var useHEVC: Bool { receiverDecodesHEVC && preset == .retina5KScaled }
+    private var streamSize: (width: Int, height: Int) { useHEVC ? (5120, 2880) : preset.streamSize }
+    private var bitrate: Int { useHEVC ? 120_000_000 : preset.bitrate }
     private var sleepAssertion: IOPMAssertionID = 0
     private let fps = 60
 
@@ -108,7 +116,7 @@ final class SessionController {
     // Roughly three stream-sized frames; beyond this the link is backed up
     // and we drop frames pre-encode so latency doesn't snowball.
     private var maxPendingBytes: Int {
-        preset.bitrate / 8 / fps * 3
+        bitrate / 8 / fps * 3
     }
 
     private var preset: DisplayPreset {
@@ -174,7 +182,12 @@ final class SessionController {
                     self?.currentInterfaceLabel ?? "unknown interface",
                     pinnedInterface != nil ? "pinned" : (wiredOnly ? "wired" : "default"))
             self?.onStateChange?(self?.state ?? .idle)  // refresh the menu's "via" line
-            self?.handleConnected(name: name)
+            // Normally the receiver's caps start the stream; one that never
+            // sends caps (e.g. `nc` in the test harness) gets H.264 after 1 s.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                guard let self, let conn, self.connection === conn else { return }
+                self.handleConnected(name: name)
+            }
         }
         conn.onClosed = { [weak self, weak conn] reason in
             // Only react to the connection we currently own; a connection we
@@ -196,22 +209,29 @@ final class SessionController {
         }
         conn.onMessage = { [weak self, weak conn] msg in
             guard let self, let conn, self.connection === conn else { return }
-            if case .caps(let w, let h, let receiverName, _, _, let drawsCursor) = msg {
-                lunaLog("luna: receiver %@ reports screen %dx%d", receiverName, w, h)
+            if case .caps(let w, let h, let receiverName, _, _, let drawsCursor, let decodesHEVC) = msg {
+                lunaLog("luna: receiver %@ reports screen %dx%d, HEVC decode %@",
+                        receiverName, w, h, decodesHEVC ? "yes" : "no")
+                if !self.virtualDisplay.isActive {
+                    self.receiverDecodesHEVC = decodesHEVC
+                }
                 if drawsCursor {
                     self.receiverDrawsCursor = true
                     self.encoder?.hideCursor()
                     self.startCursorTracking()
                 }
+                self.handleConnected(name: name)
             }
         }
         conn.start()
     }
 
+    /// Runs once per connection, on caps or the caps timeout.
     private func handleConnected(name: String) {
-        guard let connection else { return }
+        guard let connection, !virtualDisplay.isActive else { return }
         let preset = preset
-        let stream = preset.streamSize
+        let stream = streamSize
+        lunaLog("luna: streaming %dx%d %@", stream.width, stream.height, useHEVC ? "HEVC" : "H.264")
 
         connection.send(LunaWire.helloData(
             streamWidth: stream.width,
@@ -243,11 +263,12 @@ final class SessionController {
         }
         let encoder = CaptureEncoder(config: .init(
             displayID: virtualDisplay.displayID,
-            streamWidth: preset.streamSize.width,
-            streamHeight: preset.streamSize.height,
+            streamWidth: streamSize.width,
+            streamHeight: streamSize.height,
             fps: fps,
-            bitrate: preset.bitrate,
-            showsCursor: !receiverDrawsCursor
+            bitrate: bitrate,
+            showsCursor: !receiverDrawsCursor,
+            hevc: useHEVC
         ))
         self.encoder = encoder
         encoder.onPacket = { [weak connection] packet in
@@ -300,6 +321,7 @@ final class SessionController {
         cursorTracker?.stop()
         cursorTracker = nil
         receiverDrawsCursor = false
+        receiverDecodesHEVC = false
         encoder?.stop()
         encoder = nil
         connection?.cancel()

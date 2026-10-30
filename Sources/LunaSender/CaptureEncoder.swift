@@ -17,12 +17,13 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
         var fps: Int
         var bitrate: Int
         var showsCursor = true
+        var hevc = false
     }
 
     private var config: Config
     private let captureQueue = DispatchQueue(label: "luna.capture", qos: .userInteractive)
     private var stream: SCStream?
-    private var encoder: H264Encoder?
+    private var encoder: VideoEncoder?
 
     /// Called with wire-ready packets (paramSets / frame envelopes).
     var onPacket: ((Data) -> Void)?
@@ -49,15 +50,18 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func start() {
-        guard let encoder = H264Encoder(config: .init(
+        var encoderConfig = VideoEncoder.Config(
             width: config.streamWidth, height: config.streamHeight, fps: config.fps, bitrate: config.bitrate,
             colorProperties: Self.colorProperties
-        )) else {
-            onError?("Could not create the H.264 encoder")
+        )
+        encoderConfig.hevc = config.hevc
+        guard let encoder = VideoEncoder(config: encoderConfig) else {
+            onError?("Could not create the \(config.hevc ? "HEVC" : "H.264") encoder")
             return
         }
-        encoder.onParameterSets = { [weak self] sps, pps in
-            self?.onPacket?(LunaWire.paramSetsData(sps: sps, pps: pps))
+        let hevc = config.hevc
+        encoder.onParameterSets = { [weak self] sets in
+            self?.onPacket?(hevc ? LunaWire.hevcParamSetsData(sets) : LunaWire.paramSetsData(sps: sets[0], pps: sets[1]))
         }
         encoder.onEncodedFrame = { [weak self] pts, keyframe, avcc in
             self?.onPacket?(LunaWire.frameData(ptsMicros: pts, keyframe: keyframe, avcc: avcc))

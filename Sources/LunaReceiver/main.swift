@@ -284,7 +284,11 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
             preventDisplaySleep(true)
         case .paramSets(let sps, let pps):
             guard !headless else { return }
-            pipeline.setParameterSets(sps: sps, pps: pps)
+            pipeline.setParameterSets([sps, pps], hevc: false)
+            statusField.isHidden = true
+        case .hevcParamSets(let sets):
+            guard !headless else { return }
+            pipeline.setParameterSets(sets, hevc: true)
             statusField.isHidden = true
         case .frame(let pts, _, let data):
             guard !headless else { return }

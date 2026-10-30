@@ -6,9 +6,11 @@
 //   hello        (1): JSON {v, w, h, fps, name}
 //   paramSets    (3): [spsLen: u16 LE][sps][ppsLen: u16 LE][pps]
 //   frame        (4): [ptsMicros: i64 LE][flags: u8][AVCC data]   flags bit 0 = keyframe
+//   hevcParamSets(12): [count: u8] then count x [len: u16 LE][VPS/SPS/PPS]
+//                      the following frames are HEVC; paramSets switches back to H.264
 //
 // Receiver -> sender:
-//   caps         (2): JSON {v, maxW, maxH, name, cam, mic, cursor}
+//   caps         (2): JSON {v, maxW, maxH, name, cam, mic, cursor, hevc}
 //   camParamSets (5): same layout as paramSets
 //   camFrame     (6): same layout as frame
 //   audio        (7): [ptsMicros: i64 LE][sampleRate: u32 LE][channels: u8][PCM s16 LE interleaved]
@@ -20,6 +22,9 @@
 //                     hot spot as a fraction of the image, size as a fraction of the display
 //   cursorPos   (11): [x: f32][y: f32][visible: u8] — hot spot as a fraction of the display, top-left origin
 //
+// Receivers that set caps.hevc hardware-decode HEVC, which carries a full
+// 5120x2880 frame; H.264 tops out around 4K on the iMacs' decoders.
+//
 // Receivers that set caps.cursor draw the cursor themselves from cursorImage/
 // cursorPos, so it moves without waiting for capture, encode and decode.
 
@@ -27,7 +32,7 @@ import Foundation
 
 public enum LunaMessage: Equatable {
     case hello(streamWidth: Int, streamHeight: Int, fps: Int, senderName: String)
-    case caps(screenWidth: Int, screenHeight: Int, name: String, hasCamera: Bool, hasMic: Bool, drawsCursor: Bool = false)
+    case caps(screenWidth: Int, screenHeight: Int, name: String, hasCamera: Bool, hasMic: Bool, drawsCursor: Bool = false, decodesHEVC: Bool = false)
     case paramSets(sps: Data, pps: Data)
     case frame(ptsMicros: Int64, keyframe: Bool, data: Data)
     case camParamSets(sps: Data, pps: Data)
@@ -37,6 +42,7 @@ public enum LunaMessage: Equatable {
     case captureStatus(camera: String, mic: String)
     case cursorImage(hotX: Float, hotY: Float, width: Float, height: Float, png: Data)
     case cursorPos(x: Float, y: Float, visible: Bool)
+    case hevcParamSets([Data])
 
     /// High-rate media flowing back from the receiver (camera frames, audio).
     public var isReverseMedia: Bool {
@@ -59,6 +65,7 @@ public enum LunaWire {
     public static let typeCaptureStatus: UInt8 = 9
     public static let typeCursorImage: UInt8 = 10
     public static let typeCursorPos: UInt8 = 11
+    public static let typeHEVCParamSets: UInt8 = 12
 
     public static let serviceType = "_lunax._tcp"
 
@@ -95,11 +102,20 @@ public enum LunaWire {
         envelope(type: typeHello, payload: json(["v": 2, "w": streamWidth, "h": streamHeight, "fps": fps, "name": senderName]))
     }
 
-    public static func capsData(screenWidth: Int, screenHeight: Int, name: String, hasCamera: Bool, hasMic: Bool, drawsCursor: Bool = false) -> Data {
+    public static func capsData(screenWidth: Int, screenHeight: Int, name: String, hasCamera: Bool, hasMic: Bool, drawsCursor: Bool = false, decodesHEVC: Bool = false) -> Data {
         envelope(type: typeCaps, payload: json([
             "v": 2, "maxW": screenWidth, "maxH": screenHeight, "name": name, "cam": hasCamera, "mic": hasMic,
-            "cursor": drawsCursor,
+            "cursor": drawsCursor, "hevc": decodesHEVC,
         ]))
+    }
+
+    public static func hevcParamSetsData(_ sets: [Data]) -> Data {
+        var p = Data([UInt8(sets.count)])
+        for set in sets {
+            appendU16LE(&p, UInt16(set.count))
+            p.append(set)
+        }
+        return envelope(type: typeHEVCParamSets, payload: p)
     }
 
     static func appendF32LE(_ d: inout Data, _ v: Float) {
@@ -276,7 +292,8 @@ public final class LunaMessageParser {
                 name: dict["name"] as? String ?? "Mac",
                 hasCamera: dict["cam"] as? Bool ?? false,
                 hasMic: dict["mic"] as? Bool ?? false,
-                drawsCursor: dict["cursor"] as? Bool ?? false
+                drawsCursor: dict["cursor"] as? Bool ?? false,
+                decodesHEVC: dict["hevc"] as? Bool ?? false
             )
         case LunaWire.typeParamSets:
             guard let ps = parameterSets(payload) else { return nil }
@@ -303,6 +320,19 @@ public final class LunaMessageParser {
         case LunaWire.typeCaptureStatus:
             guard let dict = jsonDict(payload) else { return nil }
             return .captureStatus(camera: dict["cam"] as? String ?? "off", mic: dict["mic"] as? String ?? "off")
+        case LunaWire.typeHEVCParamSets:
+            let bytes = [UInt8](payload)
+            guard let count = bytes.first else { return nil }
+            var sets: [Data] = []
+            var offset = 1
+            for _ in 0 ..< count {
+                guard bytes.count >= offset + 2 else { return nil }
+                let len = Int(bytes[offset]) | Int(bytes[offset + 1]) << 8
+                guard bytes.count >= offset + 2 + len else { return nil }
+                sets.append(Data(bytes[(offset + 2) ..< (offset + 2 + len)]))
+                offset += 2 + len
+            }
+            return .hevcParamSets(sets)
         case LunaWire.typeCursorImage:
             guard payload.count >= 16 else { return nil }
             let bytes = [UInt8](payload.prefix(16))

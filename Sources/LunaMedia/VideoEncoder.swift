@@ -4,16 +4,18 @@ import VideoToolbox
 import CoreMedia
 import CoreVideo
 
-/// Thin VideoToolbox H.264 encoder. Feed it pixel buffers, get back parameter
-/// sets (whenever they change) and AVCC-framed access units. Used for the
+/// Thin VideoToolbox H.264/HEVC encoder. Feed it pixel buffers, get back
+/// parameter sets (whenever they change) and length-prefixed access units. Used for the
 /// screen stream on the sender and the camera stream on the receiver, so it
 /// only relies on API available back to macOS 10.15.
-public final class H264Encoder {
+public final class VideoEncoder {
     public struct Config {
         public var width: Int
         public var height: Int
         public var fps: Int
         public var bitrate: Int
+        /// HEVC instead of H.264.
+        public var hevc = false
         /// Seconds between forced keyframes.
         public var keyframeInterval = 2
         /// Color tags (ColorPrimaries, TransferFunction, YCbCrMatrix) for the VUI.
@@ -28,17 +30,17 @@ public final class H264Encoder {
         }
     }
 
-    /// Emitted (on the encoder's callback thread) whenever the SPS/PPS change,
-    /// always before the keyframe that uses them.
-    public var onParameterSets: ((_ sps: Data, _ pps: Data) -> Void)?
+    /// Emitted (on the encoder's callback thread) whenever the parameter sets
+    /// change, always before the keyframe that uses them. SPS, PPS for H.264;
+    /// VPS, SPS, PPS for HEVC.
+    public var onParameterSets: ((_ sets: [Data]) -> Void)?
     /// Emitted for every encoded access unit, AVCC framing (4-byte lengths).
     public var onEncodedFrame: ((_ ptsMicros: Int64, _ keyframe: Bool, _ avcc: Data) -> Void)?
 
     public private(set) var framesEncoded = 0
 
     private var session: VTCompressionSession?
-    private var lastSPS: Data?
-    private var lastPPS: Data?
+    private var lastParameterSets: [Data] = []
     private var forceNextKeyframe = true
 
     /// Returns nil when no encoder could be created for this configuration.
@@ -54,7 +56,7 @@ public final class H264Encoder {
                 allocator: nil,
                 width: Int32(config.width),
                 height: Int32(config.height),
-                codecType: kCMVideoCodecType_H264,
+                codecType: config.hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
                 encoderSpecification: spec,
                 imageBufferAttributes: nil,
                 compressedDataAllocator: nil,
@@ -87,7 +89,8 @@ public final class H264Encoder {
         }
         set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
         set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
-        set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel)
+        set(kVTCompressionPropertyKey_ProfileLevel,
+            config.hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel)
         set(kVTCompressionPropertyKey_AverageBitRate, config.bitrate as CFNumber)
         set(kVTCompressionPropertyKey_ExpectedFrameRate, config.fps as CFNumber)
         set(kVTCompressionPropertyKey_MaxKeyFrameInterval, (config.fps * config.keyframeInterval) as CFNumber)
@@ -164,35 +167,31 @@ public final class H264Encoder {
     }
 
     private func sendParameterSetsIfNeeded(_ desc: CMFormatDescription) {
-        var spsPointer: UnsafePointer<UInt8>?
-        var spsSize = 0
-        var ppsPointer: UnsafePointer<UInt8>?
-        var ppsSize = 0
-        var count = 0
-        var nalHeaderLength: Int32 = 0
-
-        guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-            desc, parameterSetIndex: 0,
-            parameterSetPointerOut: &spsPointer, parameterSetSizeOut: &spsSize,
-            parameterSetCountOut: &count, nalUnitHeaderLengthOut: &nalHeaderLength
-        ) == noErr,
-        CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-            desc, parameterSetIndex: 1,
-            parameterSetPointerOut: &ppsPointer, parameterSetSizeOut: &ppsSize,
-            parameterSetCountOut: &count, nalUnitHeaderLengthOut: &nalHeaderLength
-        ) == noErr,
-        let spsPointer, let ppsPointer, nalHeaderLength == 4
-        else {
-            lunaLog("luna: unexpected parameter set layout (nal header %d)", nalHeaderLength)
-            return
+        let hevc = CMFormatDescriptionGetMediaSubType(desc) == kCMVideoCodecType_HEVC
+        var sets: [Data] = []
+        var count = 1
+        var index = 0
+        while index < count {
+            var pointer: UnsafePointer<UInt8>?
+            var size = 0
+            var nalHeaderLength: Int32 = 0
+            let status = hevc
+                ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                    desc, parameterSetIndex: index, parameterSetPointerOut: &pointer,
+                    parameterSetSizeOut: &size, parameterSetCountOut: &count, nalUnitHeaderLengthOut: &nalHeaderLength)
+                : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                    desc, parameterSetIndex: index, parameterSetPointerOut: &pointer,
+                    parameterSetSizeOut: &size, parameterSetCountOut: &count, nalUnitHeaderLengthOut: &nalHeaderLength)
+            guard status == noErr, let pointer, nalHeaderLength == 4 else {
+                lunaLog("luna: unexpected parameter set layout (nal header %d)", nalHeaderLength)
+                return
+            }
+            sets.append(Data(bytes: pointer, count: size))
+            index += 1
         }
-
-        let sps = Data(bytes: spsPointer, count: spsSize)
-        let pps = Data(bytes: ppsPointer, count: ppsSize)
-        if sps != lastSPS || pps != lastPPS {
-            lastSPS = sps
-            lastPPS = pps
-            onParameterSets?(sps, pps)
+        if sets != lastParameterSets {
+            lastParameterSets = sets
+            onParameterSets?(sets)
         }
     }
 }

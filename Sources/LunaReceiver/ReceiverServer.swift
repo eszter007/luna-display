@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import Network
+import VideoToolbox
 import LunaProto
 
 /// Advertises this Mac via Bonjour and accepts one sender connection.
@@ -121,7 +122,8 @@ final class ReceiverServer {
                         // This build has no reverse camera/mic channel.
                         hasCamera: false,
                         hasMic: false,
-                        drawsCursor: true
+                        drawsCursor: true,
+                        decodesHEVC: VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
                     ),
                     completion: .contentProcessed { _ in }
                 )

@@ -20,24 +20,39 @@ final class VideoPipeline {
         layer.flush()
     }
 
-    func setParameterSets(sps: Data, pps: Data) {
+    /// SPS, PPS for H.264; VPS, SPS, PPS for HEVC.
+    func setParameterSets(_ sets: [Data], hevc: Bool) {
         var desc: CMVideoFormatDescription?
-        let status: OSStatus = sps.withUnsafeBytes { spsRaw in
-            pps.withUnsafeBytes { ppsRaw in
-                guard let spsBase = spsRaw.bindMemory(to: UInt8.self).baseAddress,
-                      let ppsBase = ppsRaw.bindMemory(to: UInt8.self).baseAddress
-                else { return OSStatus(-1) }
-                let pointers: [UnsafePointer<UInt8>] = [spsBase, ppsBase]
-                let sizes: [Int] = [sps.count, pps.count]
-                return CMVideoFormatDescriptionCreateFromH264ParameterSets(
+        // Copy into one buffer so every pointer stays valid for the call.
+        let joined = sets.reduce(Data(), +)
+        let status: OSStatus = joined.withUnsafeBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress, !sets.isEmpty else { return OSStatus(-1) }
+            let sizes = sets.map(\.count)
+            var pointers: [UnsafePointer<UInt8>] = []
+            var offset = 0
+            for size in sizes {
+                pointers.append(base + offset)
+                offset += size
+            }
+            if hevc {
+                return CMVideoFormatDescriptionCreateFromHEVCParameterSets(
                     allocator: kCFAllocatorDefault,
-                    parameterSetCount: 2,
+                    parameterSetCount: sets.count,
                     parameterSetPointers: pointers,
                     parameterSetSizes: sizes,
                     nalUnitHeaderLength: 4,
+                    extensions: nil,
                     formatDescriptionOut: &desc
                 )
             }
+            return CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                allocator: kCFAllocatorDefault,
+                parameterSetCount: sets.count,
+                parameterSetPointers: pointers,
+                parameterSetSizes: sizes,
+                nalUnitHeaderLength: 4,
+                formatDescriptionOut: &desc
+            )
         }
         guard status == noErr, let desc else {
             lunaLog("luna: could not create format description (%d)", status)
