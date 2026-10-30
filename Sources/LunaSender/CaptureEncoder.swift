@@ -26,6 +26,11 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
     private let captureQueue = DispatchQueue(label: "luna.capture", qos: .userInteractive)
     private var stream: SCStream?
     private var encoders: [VideoEncoder] = []
+    private let encodeQueue = DispatchQueue(label: "luna.encode", qos: .userInteractive)
+    /// Newest captured frame not yet picked up by the encode queue.
+    private let pendingLock = NSLock()
+    private var pendingFrame: (CVPixelBuffer, CMTime)?
+    private var draining = false
     private var tilePool: CVPixelBufferPool?
 
     /// Called with wire-ready packets (paramSets / frame envelopes).
@@ -33,17 +38,23 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Return true when the network is backed up and this frame should be
     /// dropped before encoding (frame-rate adapts, stream stays valid).
     var shouldDropFrame: (() -> Bool)?
+    /// Called on the capture queue for every frame handed to the encoder,
+    /// with the timestamp the receiver will ack (host time, microseconds).
+    var onFrameSubmitted: ((Int64) -> Void)?
+    /// Called when a captured frame is replaced by a newer one before the
+    /// encoder got to it.
+    var onFrameSkipped: (() -> Void)?
     var onError: ((String) -> Void)?
 
     var framesSent: Int { encoders.first?.framesEncoded ?? 0 }
     private(set) var framesDropped = 0
 
-    /// Written into the H.264 VUI so the receiver color-manages the stream as
-    /// Display P3 with the sRGB curve. Untagged video is shown with the
-    /// Rec. 709 video gamma, which looks washed out for desktop content.
+    /// Only the YCbCr matrix: the receiver converts to RGB with it and labels
+    /// the result Display P3 itself. Primaries/transfer tags here must not
+    /// differ from the frames' own: ScreenCaptureKit labels its (P3) frames
+    /// Rec. 709, and on any mismatch VideoToolbox "converts" every frame on a
+    /// slow path (~100 ms at 5K) that also drains saturation.
     static let colorProperties: [CFString: CFString] = [
-        kVTCompressionPropertyKey_ColorPrimaries: kCVImageBufferColorPrimaries_P3_D65,
-        kVTCompressionPropertyKey_TransferFunction: kCVImageBufferTransferFunction_sRGB,
         kVTCompressionPropertyKey_YCbCrMatrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
     ]
 
@@ -162,24 +173,60 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
             framesDropped += 1
             return
         }
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        // Never make ScreenCaptureKit wait: an encode call blocks for the
+        // whole encode, and while this callback runs SCK queues new frames,
+        // each then arriving that much later. Hand over the newest frame and
+        // return; the encode queue always takes the newest one waiting.
+        pendingLock.lock()
+        let replaced = pendingFrame != nil
+        pendingFrame = (pixelBuffer, CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        let startDraining = !draining
+        draining = true
+        pendingLock.unlock()
+        if replaced { onFrameSkipped?() }
+        if startDraining {
+            encodeQueue.async { [weak self] in self?.drainPendingFrames() }
+        }
+    }
+
+    /// Encode queue.
+    private func drainPendingFrames() {
+        while true {
+            pendingLock.lock()
+            guard let (pixelBuffer, pts) = pendingFrame else {
+                draining = false
+                pendingLock.unlock()
+                return
+            }
+            pendingFrame = nil
+            pendingLock.unlock()
+            encode(pixelBuffer, pts: pts)
+        }
+    }
+
+    private func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
+        let encoders = encoders
+        guard !encoders.isEmpty else { return }
+        // Same rounding as VideoEncoder's ptsMicros, so acks match.
+        onFrameSubmitted?(Int64(CMTimeGetSeconds(pts) * 1_000_000))
         if encoders.count == 1 {
             encoders[0].encode(pixelBuffer, pts: pts)
             return
         }
-        for (index, encoder) in encoders.enumerated() {
+        // Both halves at once; one after the other they would take twice as long.
+        makeTilePool(for: pixelBuffer, count: encoders.count)
+        DispatchQueue.concurrentPerform(iterations: encoders.count) { index in
             guard let strip = copyStrip(pixelBuffer, index: index, count: encoders.count) else { return }
-            encoder.encode(strip, pts: pts)
+            encoders[index].encode(strip, pts: pts)
         }
     }
 
-    /// Copies one vertical strip of a bi-planar 4:2:0 frame into a pooled
-    /// buffer. ponytail: CPU copy, about 2 ms per 5K frame on Apple Silicon;
-    /// a VTPixelTransferSession crop would move it to the GPU if that matters.
-    private func copyStrip(_ source: CVPixelBuffer, index: Int, count: Int) -> CVPixelBuffer? {
+    /// Encode queue, before the strips are copied in parallel.
+    private func makeTilePool(for source: CVPixelBuffer, count: Int) {
+        guard tilePool == nil else { return }
         let width = CVPixelBufferGetWidth(source) / count
         let height = CVPixelBufferGetHeight(source)
-        if tilePool == nil {
+        do {
             let attributes: [CFString: Any] = [
                 kCVPixelBufferPixelFormatTypeKey: CVPixelBufferGetPixelFormatType(source),
                 kCVPixelBufferWidthKey: width,
@@ -188,6 +235,13 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
             ]
             CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &tilePool)
         }
+    }
+
+    /// Copies one vertical strip of a bi-planar 4:2:0 frame into a pooled
+    /// buffer. ponytail: CPU copy, about 2 ms per 5K frame on Apple Silicon;
+    /// a VTPixelTransferSession crop would move it to the GPU if that matters.
+    private func copyStrip(_ source: CVPixelBuffer, index: Int, count: Int) -> CVPixelBuffer? {
+        let width = CVPixelBufferGetWidth(source) / count
         var strip: CVPixelBuffer?
         guard let tilePool, CVPixelBufferPoolCreatePixelBuffer(nil, tilePool, &strip) == kCVReturnSuccess,
               let strip

@@ -26,6 +26,17 @@ final class ReceiverServer {
     var onListening: ((String) -> Void)?
     var onMessage: ((LunaMessage) -> Void)?
     var onDisconnected: (() -> Void)?
+    /// Video messages (hello, parameter sets, frames), called right on the
+    /// network queue so frames reach the decoder without waiting for the main
+    /// thread, which is busy drawing the 5K window. hello also goes to onMessage.
+    var onVideoMessage: ((LunaMessage) -> Void)?
+    /// Network queue, when the sender is gone.
+    var onVideoReset: (() -> Void)?
+
+    /// Runs `block` on the network queue, where the video state lives.
+    func onNetworkQueue(_ block: @escaping () -> Void) {
+        queue.async(execute: block)
+    }
 
     /// "Thunderbolt Bridge (bridge0)" — the link the sender's connection
     /// arrived on. Written on the network queue when the connection becomes
@@ -141,10 +152,21 @@ final class ReceiverServer {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [weak self] data, _, isComplete, error in
             guard let self, self.connection === conn else { return }
             if let data, !data.isEmpty {
-                let messages = self.parser.feed(data)
-                if !messages.isEmpty {
+                var forMain: [LunaMessage] = []
+                for msg in self.parser.feed(data) {
+                    switch msg {
+                    case .paramSets, .frame, .hevcParamSets, .hevcFrame:
+                        self.onVideoMessage?(msg)
+                    case .hello:
+                        self.onVideoMessage?(msg)
+                        forMain.append(msg)
+                    default:
+                        forMain.append(msg)
+                    }
+                }
+                if !forMain.isEmpty {
                     DispatchQueue.main.async {
-                        for msg in messages { self.onMessage?(msg) }
+                        for msg in forMain { self.onMessage?(msg) }
                     }
                 }
                 if self.parser.corrupted {
@@ -190,6 +212,7 @@ final class ReceiverServer {
             conn.cancel()
             self.connection = nil
             self.connectionInterfaceLabel = nil
+            self.onVideoReset?()
             DispatchQueue.main.async { self.onDisconnected?() }
         }
     }

@@ -36,6 +36,7 @@ final class ProtoTests: XCTestCase {
             LunaWire.cursorPosData(x: 0.5, y: -0.125, visible: true),
             LunaWire.capsData(screenWidth: 5120, screenHeight: 2880, name: "iMac", hasCamera: false, hasMic: false, decodesHEVC: true),
             LunaWire.hevcParamSetsData(tile: 1, sets: [sps, pps, avcc]),
+            LunaWire.frameAckData(ptsMicros: -77),
             LunaWire.hevcFrameData(tile: 1, ptsMicros: 9, keyframe: true, data: avcc),
             LunaWire.helloData(streamWidth: 5120, streamHeight: 2880, fps: 60, senderName: "MacBook", tiles: 2),
         ]
@@ -54,6 +55,7 @@ final class ProtoTests: XCTestCase {
             .cursorPos(x: 0.5, y: -0.125, visible: true),
             .caps(screenWidth: 5120, screenHeight: 2880, name: "iMac", hasCamera: false, hasMic: false, decodesHEVC: true),
             .hevcParamSets(tile: 1, sets: [sps, pps, avcc]),
+            .frameAck(ptsMicros: -77),
             .hevcFrame(tile: 1, ptsMicros: 9, keyframe: true, data: avcc),
             .hello(streamWidth: 5120, streamHeight: 2880, fps: 60, senderName: "MacBook", tiles: 2),
         ]

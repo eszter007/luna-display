@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import CoreMedia
 import Network
 import IOKit.pwr_mgt
 import LunaProto
@@ -78,6 +79,19 @@ final class SessionController {
     private var cursorTracker: CursorTracker?
     /// The receiver said (in caps) it draws the cursor from cursorPos messages.
     private var receiverDrawsCursor = false
+    /// Frames handed to the encoder and not yet acked by the receiver
+    /// (timestamp -> host time submitted). Touched from the capture queue and main.
+    private let flightLock = NSLock()
+    private var inFlight: [Int64: Double] = [:]
+    private var acksSeen = false
+    private var stats = StreamStats()
+    private var statsTimer: Timer?
+    /// When the oldest unacked frame is this old, frames are queuing somewhere
+    /// (network, receiver), so the next capture is skipped instead. A frame
+    /// count would not do: a healthy round trip already spans 3-4 frames at
+    /// 60 fps, and a cap of 3 skipped frames all the time.
+    private static let maxFrameAge = 0.1
+
     /// The receiver said (in caps) it hardware-decodes HEVC.
     private var receiverDecodesHEVC = false
 
@@ -207,6 +221,7 @@ final class SessionController {
                 self.disconnect()
             }
         }
+        conn.onFrameAck = { [weak self] pts in self?.frameAcked(pts) }
         conn.onMessage = { [weak self, weak conn] msg in
             guard let self, let conn, self.connection === conn else { return }
             if case .caps(let w, let h, let receiverName, _, _, let drawsCursor, let decodesHEVC) = msg {
@@ -278,7 +293,20 @@ final class SessionController {
         }
         encoder.shouldDropFrame = { [weak self, weak connection] in
             guard let self, let connection else { return true }
-            return connection.pendingBytes > self.maxPendingBytes
+            if connection.pendingBytes > self.maxPendingBytes {
+                self.flightLock.lock()
+                self.stats.droppedNetwork += 1
+                self.flightLock.unlock()
+                return true
+            }
+            return self.tooManyInFlight()
+        }
+        encoder.onFrameSubmitted = { [weak self] pts in self?.frameSubmitted(pts) }
+        encoder.onFrameSkipped = { [weak self] in
+            guard let self else { return }
+            self.flightLock.lock()
+            self.stats.droppedEncoderBusy += 1
+            self.flightLock.unlock()
         }
         encoder.onError = { [weak self, weak encoder] message in
             DispatchQueue.main.async {
@@ -303,7 +331,63 @@ final class SessionController {
             }
             self.preventSleep(true)
             self.startCursorTracking()
+            self.statsTimer?.invalidate()
+            self.statsTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+                self?.logStats()
+            }
         }
+    }
+
+    private static func hostNow() -> Double {
+        CMClockGetTime(CMClockGetHostTimeClock()).seconds
+    }
+
+    /// Capture queue.
+    private func tooManyInFlight() -> Bool {
+        flightLock.lock()
+        defer { flightLock.unlock() }
+        guard acksSeen else { return false }  // older receivers never ack
+        // A frame unacked for half a second is lost (e.g. a decoder flush);
+        // forget it so the stream can't stall waiting for it.
+        let cutoff = Self.hostNow() - 0.5
+        inFlight = inFlight.filter { $0.value > cutoff }
+        if let oldest = inFlight.values.min(), Self.hostNow() - oldest > Self.maxFrameAge {
+            stats.droppedBacklog += 1
+            return true
+        }
+        return false
+    }
+
+    /// Capture queue.
+    private func frameSubmitted(_ pts: Int64) {
+        let now = Self.hostNow()
+        flightLock.lock()
+        inFlight[pts] = now
+        stats.submitted += 1
+        stats.captureDelays.append(now - Double(pts) / 1_000_000)
+        flightLock.unlock()
+    }
+
+    /// Network queue.
+    private func frameAcked(_ pts: Int64) {
+        let now = Self.hostNow()
+        flightLock.lock()
+        acksSeen = true
+        // pts is the capture time on the host clock: this is capture -> decoded on the iMac.
+        stats.latencies.append(now - Double(pts) / 1_000_000)
+        inFlight = inFlight.filter { $0.key > pts }
+        flightLock.unlock()
+    }
+
+    private func logStats() {
+        flightLock.lock()
+        let s = stats
+        stats = StreamStats()
+        flightLock.unlock()
+        lunaLog("luna: last 5 s: %d frames sent, %d skipped (network), %d skipped (receiver behind), "
+                + "%d skipped (encoder busy); capture->encoder %@, capture->decoded on receiver %@",
+                s.submitted, s.droppedNetwork, s.droppedBacklog, s.droppedEncoderBusy,
+                StreamStats.describe(s.captureDelays), StreamStats.describe(s.latencies))
     }
 
     /// Needs both the virtual display and the receiver's caps; called when
@@ -324,6 +408,13 @@ final class SessionController {
         cursorTracker = nil
         receiverDrawsCursor = false
         receiverDecodesHEVC = false
+        statsTimer?.invalidate()
+        statsTimer = nil
+        flightLock.lock()
+        inFlight = [:]
+        acksSeen = false
+        stats = StreamStats()
+        flightLock.unlock()
         encoder?.stop()
         encoder = nil
         connection?.cancel()
@@ -345,5 +436,21 @@ final class SessionController {
             IOPMAssertionRelease(sleepAssertion)
             sleepAssertion = 0
         }
+    }
+}
+
+/// Counters for the periodic stream log line.
+struct StreamStats {
+    var submitted = 0
+    var droppedNetwork = 0
+    var droppedBacklog = 0
+    var droppedEncoderBusy = 0
+    var captureDelays: [Double] = []
+    var latencies: [Double] = []
+
+    static func describe(_ seconds: [Double]) -> String {
+        guard !seconds.isEmpty else { return "n/a" }
+        let ms = seconds.map { $0 * 1000 }.sorted()
+        return String(format: "median %.0f ms, p90 %.0f ms", ms[ms.count / 2], ms[ms.count * 9 / 10])
     }
 }

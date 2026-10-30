@@ -14,11 +14,14 @@
 // in parallel, which halves the per-frame encode time at 5K.
 //
 // Receiver -> sender:
-//   caps         (2): JSON {v, maxW, maxH, name, cam, mic, cursor, hevc}
+//   caps         (2): JSON {v, maxW, maxH, name, cam, mic, cursor, hevcTiles}
 //   camParamSets (5): same layout as paramSets
 //   camFrame     (6): same layout as frame
 //   audio        (7): [ptsMicros: i64 LE][sampleRate: u32 LE][channels: u8][PCM s16 LE interleaved]
 //   captureStatus(9): JSON {cam, mic} — strings: "off", "streaming", "denied", "none", "error: …"
+//   frameAck    (14): [ptsMicros: i64 LE] — every tile of that frame is decoded.
+//                     Once acks arrive, the sender caps the frames in flight
+//                     so no queue builds up anywhere between capture and decode.
 //
 // Sender -> receiver:
 //   capture      (8): JSON {cam: bool, mic: bool} — start/stop the iMac's camera and mic
@@ -26,7 +29,7 @@
 //                     hot spot as a fraction of the image, size as a fraction of the display
 //   cursorPos   (11): [x: f32][y: f32][visible: u8] — hot spot as a fraction of the display, top-left origin
 //
-// Receivers that set caps.hevc hardware-decode HEVC, which carries a full
+// Receivers that set caps.hevcTiles hardware-decode HEVC, which carries a full
 // 5120x2880 frame; H.264 tops out around 4K on the iMacs' decoders.
 //
 // Receivers that set caps.cursor draw the cursor themselves from cursorImage/
@@ -48,6 +51,7 @@ public enum LunaMessage: Equatable {
     case cursorPos(x: Float, y: Float, visible: Bool)
     case hevcParamSets(tile: Int, sets: [Data])
     case hevcFrame(tile: Int, ptsMicros: Int64, keyframe: Bool, data: Data)
+    case frameAck(ptsMicros: Int64)
 
     /// High-rate media flowing back from the receiver (camera frames, audio).
     public var isReverseMedia: Bool {
@@ -72,6 +76,7 @@ public enum LunaWire {
     public static let typeCursorPos: UInt8 = 11
     public static let typeHEVCParamSets: UInt8 = 12
     public static let typeHEVCFrame: UInt8 = 13
+    public static let typeFrameAck: UInt8 = 14
 
     public static let serviceType = "_lunax._tcp"
 
@@ -113,7 +118,7 @@ public enum LunaWire {
     public static func capsData(screenWidth: Int, screenHeight: Int, name: String, hasCamera: Bool, hasMic: Bool, drawsCursor: Bool = false, decodesHEVC: Bool = false) -> Data {
         envelope(type: typeCaps, payload: json([
             "v": 2, "maxW": screenWidth, "maxH": screenHeight, "name": name, "cam": hasCamera, "mic": hasMic,
-            "cursor": drawsCursor, "hevc": decodesHEVC,
+            "cursor": drawsCursor, "hevcTiles": decodesHEVC,
         ]))
     }
 
@@ -124,6 +129,12 @@ public enum LunaWire {
             p.append(set)
         }
         return envelope(type: typeHEVCParamSets, payload: p)
+    }
+
+    public static func frameAckData(ptsMicros: Int64) -> Data {
+        var p = Data(capacity: 8)
+        appendU64LE(&p, UInt64(bitPattern: ptsMicros))
+        return envelope(type: typeFrameAck, payload: p)
     }
 
     public static func hevcFrameData(tile: Int, ptsMicros: Int64, keyframe: Bool, data: Data) -> Data {
@@ -306,7 +317,9 @@ public final class LunaMessageParser {
                 hasCamera: dict["cam"] as? Bool ?? false,
                 hasMic: dict["mic"] as? Bool ?? false,
                 drawsCursor: dict["cursor"] as? Bool ?? false,
-                decodesHEVC: dict["hevc"] as? Bool ?? false
+                // Was "hevc" for the single-stream format; an old receiver reporting
+                // that must get H.264, not tiles it can't read.
+                decodesHEVC: dict["hevcTiles"] as? Bool ?? false
             )
         case LunaWire.typeParamSets:
             guard let ps = parameterSets(payload) else { return nil }
@@ -347,6 +360,9 @@ public final class LunaMessageParser {
                 offset += 2 + len
             }
             return .hevcParamSets(tile: Int(bytes[0]), sets: sets)
+        case LunaWire.typeFrameAck:
+            guard payload.count >= 8 else { return nil }
+            return .frameAck(ptsMicros: i64LE([UInt8](payload.prefix(8)), at: 0))
         case LunaWire.typeHEVCFrame:
             guard let tile = payload.first, let f = frame(payload.dropFirst()) else { return nil }
             return .hevcFrame(tile: Int(tile), ptsMicros: f.ptsMicros, keyframe: f.keyframe, data: f.data)

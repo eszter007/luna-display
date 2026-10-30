@@ -272,8 +272,14 @@ extension SenderAppDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
             if case .streaming = session.state {
                 let displayID = session.activeVirtualDisplayID
-                testLog("streaming on display \(displayID), disconnecting in 4s")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [self] in
+                let seconds = Double(ProcessInfo.processInfo.environment["LUNA_TEST_SECONDS"] ?? "") ?? 4
+                testLog("streaming on display \(displayID), disconnecting in \(Int(seconds))s")
+                // LUNA_TEST_ANIMATE=1: a window moving across the virtual
+                // display at 60 fps, like a drag, so the stats see real load.
+                let animation = ProcessInfo.processInfo.environment["LUNA_TEST_ANIMATE"] != nil
+                    ? Self.startTestAnimation(on: displayID) : nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [self] in
+                    animation?.invalidate()
                     disconnect()  // the same action the menu item fires
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [self] in
                         verifyTeardown(displayID: displayID)
@@ -285,6 +291,26 @@ extension SenderAppDelegate {
                 testLog("FAIL — never reached streaming (screen-recording permission missing?)")
                 exit(1)
             }
+        }
+    }
+
+    private static func startTestAnimation(on displayID: CGDirectDisplayID) -> Timer? {
+        guard let screen = NSScreen.screens.first(where: {
+            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == displayID
+        }) else { return nil }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+                              styleMask: [.titled], backing: .buffered, defer: false, screen: screen)
+        window.isReleasedWhenClosed = false
+        window.backgroundColor = .systemTeal
+        window.orderFrontRegardless()
+        var step = 0.0
+        return Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { timer in
+            step += 1
+            let frame = screen.frame
+            let x = frame.minX + (frame.width - 900) * (0.5 + 0.5 * sin(step / 40))
+            let y = frame.minY + (frame.height - 600) * (0.5 + 0.5 * cos(step / 55))
+            window.setFrameOrigin(NSPoint(x: x, y: y))
+            if !timer.isValid { window.close() }
         }
     }
 

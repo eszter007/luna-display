@@ -68,8 +68,12 @@ public final class VideoEncoder {
         }
 
         var session: VTCompressionSession?
-        if #available(macOS 11.3, *) {
-            // Low-latency rate control (Apple Silicon hardware encoder path).
+        // Low-latency rate control (Apple Silicon hardware encoder path) for
+        // H.264 only. For HEVC it makes every encode call block, and the halves
+        // of a 5K frame then run one after the other: ~27 ms per frame on an
+        // M5 Pro. Normal rate control without frame reordering runs them in
+        // parallel at ~14.5 ms each and keeps up with 60 fps.
+        if !config.hevc, #available(macOS 11.3, *) {
             let spec: [CFString: Any] = [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true]
             session = create(spec: spec as CFDictionary)
             if session == nil {

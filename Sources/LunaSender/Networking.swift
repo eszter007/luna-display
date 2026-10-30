@@ -116,6 +116,9 @@ final class SenderConnection {
     var onReady: (() -> Void)?          // main queue
     var onClosed: ((String?) -> Void)?  // main queue
     var onMessage: ((LunaMessage) -> Void)?  // main queue
+    /// Frame acks, called right on the network queue: they arrive 60 times a
+    /// second and feed the frame pacing, so they skip the main-queue hop.
+    var onFrameAck: ((Int64) -> Void)?
 
     private var closed = false
     private let wiredOnly: Bool
@@ -186,7 +189,11 @@ final class SenderConnection {
             guard let self else { return }
             if let data, !data.isEmpty {
                 for msg in self.parser.feed(data) {
-                    DispatchQueue.main.async { self.onMessage?(msg) }
+                    if case .frameAck(let pts) = msg {
+                        self.onFrameAck?(pts)
+                    } else {
+                        DispatchQueue.main.async { self.onMessage?(msg) }
+                    }
                 }
                 if self.parser.corrupted {
                     self.close(reason: "stream out of sync (oversized frame)")

@@ -97,8 +97,13 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
 
     private var window: ReceiverWindow!
     private var host: VideoHostView!
-    /// One per tile; H.264 streams always use the first.
-    private var pipelines = [VideoPipeline()]
+    /// One per tile; H.264 streams always use the first. Only touched on the
+    /// server's network queue (after the first one is made at launch).
+    private var pipelines: [VideoPipeline] = []
+    private var sawParameterSets = false
+    /// Tiles decoded per frame timestamp; the frame is acked once all are in.
+    private let ackLock = NSLock()
+    private var tilesDecoded: [Int64: Int] = [:]
     private let server = ReceiverServer()
     private let statusField = NSTextField(labelWithString: "Starting…")
     private var listeningText = "starting…"
@@ -138,6 +143,7 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
         window.backgroundColor = .black
         window.isReleasedWhenClosed = false
 
+        pipelines = makePipelines(count: 1)
         host = VideoHostView(videoLayer: pipelines[0].layer)
         window.contentView = host
 
@@ -184,14 +190,22 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
         server.onMessage = { [weak self] message in
             self?.handle(message)
         }
-        server.onDisconnected = { [weak self] in
+        server.onVideoMessage = { [weak self] message in
+            self?.handleVideo(message)
+        }
+        server.onVideoReset = { [weak self] in
             guard let self else { return }
             self.pipelines.forEach { $0.reset() }
+            self.sawParameterSets = false
+        }
+        server.onDisconnected = { [weak self] in
+            guard let self else { return }
             self.preventDisplaySleep(false)
             self.showWaiting()
         }
         server.start()
         showWaiting()
+        if CommandLine.arguments.contains("--windowed") { setMode(.windowed) }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -286,11 +300,6 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
         case .hello(let w, let h, let fps, let name, let tiles):
             lunaLog("luna: sender %@ streaming %dx%d@%d in %d tile(s)", name, w, h, fps, tiles)
             guard !headless else { return }
-            if pipelines.count != max(tiles, 1) {
-                pipelines.forEach { $0.reset() }
-                pipelines = (0 ..< max(tiles, 1)).map { _ in VideoPipeline() }
-                host.setVideoLayers(pipelines.map(\.layer))
-            }
             let via = server.connectionInterfaceLabel.map { " via \($0)" } ?? ""
             statusField.stringValue = "Connected to \(name)\(via)…"
             streamSize = CGSize(width: CGFloat(w), height: CGFloat(h))
@@ -302,21 +311,18 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
             }
             isStreaming = true
             applyChrome()
+            // Shows up in `log show` when the picture stays black.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self, self.isStreaming else { return }
+                self.server.onNetworkQueue {
+                    for (tile, pipeline) in self.pipelines.enumerated() {
+                        lunaLog("luna: tile %d: %@", tile, pipeline.statusDescription)
+                    }
+                }
+            }
             preventDisplaySleep(true)
-        case .paramSets(let sps, let pps):
-            guard !headless else { return }
-            pipelines[0].setParameterSets([sps, pps], hevc: false)
-            statusField.isHidden = true
-        case .hevcParamSets(let tile, let sets):
-            guard !headless, pipelines.indices.contains(tile) else { return }
-            pipelines[tile].setParameterSets(sets, hevc: true)
-            statusField.isHidden = true
-        case .frame(let pts, _, let data):
-            guard !headless else { return }
-            pipelines[0].enqueue(ptsMicros: pts, data: data)
-        case .hevcFrame(let tile, let pts, _, let data):
-            guard !headless, pipelines.indices.contains(tile) else { return }
-            pipelines[tile].enqueue(ptsMicros: pts, data: data)
+        case .paramSets, .hevcParamSets, .frame, .hevcFrame:
+            break  // handleVideo, on the network queue
         case .cursorImage(let hotX, let hotY, let width, let height, let png):
             guard !headless, let image = NSImage(data: png) else { return }
             host.setCursorImage(image, hot: CGPoint(x: CGFloat(hotX), y: CGFloat(hotY)),
@@ -324,9 +330,68 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
         case .cursorPos(let x, let y, let visible):
             guard !headless else { return }
             host.moveCursor(to: CGPoint(x: CGFloat(x), y: CGFloat(y)), visible: visible)
-        case .capture, .caps, .camParamSets, .camFrame, .audio, .captureStatus:
+        case .capture, .caps, .frameAck, .camParamSets, .camFrame, .audio, .captureStatus:
             break
         }
+    }
+
+    /// Network queue.
+    private func handleVideo(_ message: LunaMessage) {
+        switch message {
+        case .hello(_, _, _, _, let tiles):
+            let count = max(tiles, 1)
+            guard pipelines.count != count else { return }
+            pipelines.forEach { $0.reset() }
+            // Layers are made and placed on the main thread; once, per connection.
+            pipelines = DispatchQueue.main.sync {
+                let pipelines = makePipelines(count: count)
+                host.setVideoLayers(pipelines.map(\.layer))
+                return pipelines
+            }
+        case .paramSets(let sps, let pps):
+            pipelines.first?.setParameterSets([sps, pps], hevc: false)
+            parameterSetsArrived()
+        case .hevcParamSets(let tile, let sets):
+            guard pipelines.indices.contains(tile) else { return }
+            pipelines[tile].setParameterSets(sets, hevc: true)
+            parameterSetsArrived()
+        case .frame(let pts, _, let data):
+            pipelines.first?.enqueue(ptsMicros: pts, data: data)
+        case .hevcFrame(let tile, let pts, _, let data):
+            guard pipelines.indices.contains(tile) else { return }
+            pipelines[tile].enqueue(ptsMicros: pts, data: data)
+        default:
+            break
+        }
+    }
+
+    /// Network queue.
+    private func parameterSetsArrived() {
+        guard !sawParameterSets else { return }
+        sawParameterSets = true
+        DispatchQueue.main.async { self.statusField.isHidden = true }
+    }
+
+    private func makePipelines(count: Int) -> [VideoPipeline] {
+        (0 ..< count).map { _ in
+            let pipeline = VideoPipeline()
+            pipeline.onDecoded = { [weak self] pts in self?.tileDecoded(pts: pts, tiles: count) }
+            return pipeline
+        }
+    }
+
+    /// Decoder threads. Tells the sender once every tile of a frame is decoded.
+    private func tileDecoded(pts: Int64, tiles: Int) {
+        ackLock.lock()
+        let count = (tilesDecoded[pts] ?? 0) + 1
+        if count == tiles {
+            // Tiles of older frames that never completed won't any more.
+            tilesDecoded = tilesDecoded.filter { $0.key > pts }
+        } else {
+            tilesDecoded[pts] = count
+        }
+        ackLock.unlock()
+        if count == tiles { server.send(LunaWire.frameAckData(ptsMicros: pts)) }
     }
 
     private func showWaiting() {
