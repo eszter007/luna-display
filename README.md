@@ -99,6 +99,10 @@ receiver immediately, and if the receiver can't be reached over the pinned
 interface the connection fails with a message in the menu rather than
 silently switching. *Automatic* restores the wired-first behavior.
 
+The receiver draws the mouse pointer itself from small position messages,
+so the pointer moves without waiting for the video. It needs both apps from
+the same build; an older receiver gets the pointer inside the video as before.
+
 Display modes (☾ menu): Retina 5K scaled (default), Retina 4K (bigger UI),
 or 2560×1440 non-Retina (lowest bandwidth — try this first on a 1080p or
 21.5" iMac, or over a weak Wi-Fi link).
@@ -114,8 +118,6 @@ again or Esc returns to fullscreen; nothing changes unless you ask for it.
 
 - True 5K on the wire: tile the frame into 2–4 independent H.264 streams,
   each within the iMac's decoder limits, reassembled in a Metal layer.
-- Cursor position side-channel drawn receiver-side for lower perceived
-  cursor latency.
 - Adaptive bitrate from send-queue depth.
 - Clipboard sync.
 

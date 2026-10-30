@@ -20,11 +20,22 @@ enum DisplayPreset: String, CaseIterable {
         }
     }
 
-    var displayPixels: (width: UInt32, height: UInt32) {
+    /// Default "looks like" size in points.
+    var defaultMode: (UInt32, UInt32) {
         switch self {
-        case .retina5KScaled: return (5120, 2880)
-        case .retina4K: return (3840, 2160)
-        case .plain1440: return (2560, 1440)
+        case .retina5KScaled, .plain1440: return (2560, 1440)
+        case .retina4K: return (1920, 1080)
+        }
+    }
+
+    /// Sizes offered in System Settings, all 16:9. The Retina presets match
+    /// a real 5K iMac's scaled list plus 1920x1080.
+    var modes: [(UInt32, UInt32)] {
+        switch self {
+        case .retina5KScaled, .retina4K:
+            return [(3200, 1800), (2880, 1620), (2560, 1440), (2304, 1296), (2048, 1152), (1920, 1080)]
+        case .plain1440:
+            return [(2560, 1440), (1920, 1080)]
         }
     }
 
@@ -64,6 +75,9 @@ final class SessionController {
     private var connection: SenderConnection?
     private var resolver: ServiceResolver?
     private var encoder: CaptureEncoder?
+    private var cursorTracker: CursorTracker?
+    /// The receiver said (in caps) it draws the cursor from cursorPos messages.
+    private var receiverDrawsCursor = false
     private var sleepAssertion: IOPMAssertionID = 0
     private let fps = 60
 
@@ -182,8 +196,13 @@ final class SessionController {
         }
         conn.onMessage = { [weak self, weak conn] msg in
             guard let self, let conn, self.connection === conn else { return }
-            if case .caps(let w, let h, let receiverName, _, _) = msg {
+            if case .caps(let w, let h, let receiverName, _, _, let drawsCursor) = msg {
                 lunaLog("luna: receiver %@ reports screen %dx%d", receiverName, w, h)
+                if drawsCursor {
+                    self.receiverDrawsCursor = true
+                    self.encoder?.hideCursor()
+                    self.startCursorTracking()
+                }
             }
         }
         conn.start()
@@ -192,7 +211,6 @@ final class SessionController {
     private func handleConnected(name: String) {
         guard let connection else { return }
         let preset = preset
-        let pixels = preset.displayPixels
         let stream = preset.streamSize
 
         connection.send(LunaWire.helloData(
@@ -203,8 +221,8 @@ final class SessionController {
         ))
 
         guard virtualDisplay.create(
-            pixelWidth: pixels.width,
-            pixelHeight: pixels.height,
+            modes: preset.modes,
+            defaultMode: preset.defaultMode,
             hiDPI: preset.hiDPI,
             refreshHz: Double(fps),
             name: "Luna (\(name))"
@@ -228,7 +246,8 @@ final class SessionController {
             streamWidth: preset.streamSize.width,
             streamHeight: preset.streamSize.height,
             fps: fps,
-            bitrate: preset.bitrate
+            bitrate: preset.bitrate,
+            showsCursor: !receiverDrawsCursor
         ))
         self.encoder = encoder
         encoder.onPacket = { [weak connection] packet in
@@ -260,12 +279,27 @@ final class SessionController {
                 self.state = .streaming(name)
             }
             self.preventSleep(true)
+            self.startCursorTracking()
         }
+    }
+
+    /// Needs both the virtual display and the receiver's caps; called when
+    /// either arrives, starts once.
+    private func startCursorTracking() {
+        guard receiverDrawsCursor, cursorTracker == nil, virtualDisplay.isActive, let connection else { return }
+        let tracker = CursorTracker(displayID: virtualDisplay.displayID) { [weak connection] in
+            connection?.send($0)
+        }
+        tracker.start()
+        cursorTracker = tracker
     }
 
     func disconnect() {
         resolver = nil
         currentInterfaceLabel = nil
+        cursorTracker?.stop()
+        cursorTracker = nil
+        receiverDrawsCursor = false
         encoder?.stop()
         encoder = nil
         connection?.cancel()

@@ -16,12 +16,15 @@ public final class H264Encoder {
         public var bitrate: Int
         /// Seconds between forced keyframes.
         public var keyframeInterval = 2
+        /// Color tags (ColorPrimaries, TransferFunction, YCbCrMatrix) for the VUI.
+        public var colorProperties: [CFString: CFString]
 
-        public init(width: Int, height: Int, fps: Int, bitrate: Int) {
+        public init(width: Int, height: Int, fps: Int, bitrate: Int, colorProperties: [CFString: CFString] = [:]) {
             self.width = width
             self.height = height
             self.fps = fps
             self.bitrate = bitrate
+            self.colorProperties = colorProperties
         }
     }
 
@@ -92,6 +95,9 @@ public final class H264Encoder {
         // Keep bitrate spikes bounded so latency stays flat on Wi-Fi.
         let bytesPerSecond = config.bitrate / 8 * 3 / 2
         set(kVTCompressionPropertyKey_DataRateLimits, [bytesPerSecond, 1] as CFArray)
+        for (key, value) in config.colorProperties {
+            set(key, value)
+        }
         VTCompressionSessionPrepareToEncodeFrames(session)
         return session
     }

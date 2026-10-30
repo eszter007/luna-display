@@ -2,6 +2,7 @@ import Foundation
 import ScreenCaptureKit
 import CoreMedia
 import CoreVideo
+import VideoToolbox
 import LunaProto
 import LunaMedia
 
@@ -15,9 +16,10 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
         var streamHeight: Int
         var fps: Int
         var bitrate: Int
+        var showsCursor = true
     }
 
-    private let config: Config
+    private var config: Config
     private let captureQueue = DispatchQueue(label: "luna.capture", qos: .userInteractive)
     private var stream: SCStream?
     private var encoder: H264Encoder?
@@ -32,6 +34,15 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
     var framesSent: Int { encoder?.framesEncoded ?? 0 }
     private(set) var framesDropped = 0
 
+    /// Written into the H.264 VUI so the receiver color-manages the stream as
+    /// Display P3 with the sRGB curve. Untagged video is shown with the
+    /// Rec. 709 video gamma, which looks washed out for desktop content.
+    static let colorProperties: [CFString: CFString] = [
+        kVTCompressionPropertyKey_ColorPrimaries: kCVImageBufferColorPrimaries_P3_D65,
+        kVTCompressionPropertyKey_TransferFunction: kCVImageBufferTransferFunction_sRGB,
+        kVTCompressionPropertyKey_YCbCrMatrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+    ]
+
     init(config: Config) {
         self.config = config
         super.init()
@@ -39,7 +50,8 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func start() {
         guard let encoder = H264Encoder(config: .init(
-            width: config.streamWidth, height: config.streamHeight, fps: config.fps, bitrate: config.bitrate
+            width: config.streamWidth, height: config.streamHeight, fps: config.fps, bitrate: config.bitrate,
+            colorProperties: Self.colorProperties
         )) else {
             onError?("Could not create the H.264 encoder")
             return
@@ -72,8 +84,11 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
         conf.width = config.streamWidth
         conf.height = config.streamHeight
         conf.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(config.fps))
-        conf.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        conf.showsCursor = true
+        // Full range P3 so the stream matches the color tags in colorProperties.
+        conf.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        conf.colorSpaceName = CGColorSpace.displayP3
+        conf.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
+        conf.showsCursor = config.showsCursor
         conf.queueDepth = 4
 
         let stream = SCStream(filter: filter, configuration: conf, delegate: self)
@@ -91,6 +106,19 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         }
         self.stream = stream
+        self.streamConfig = conf
+    }
+
+    private var streamConfig: SCStreamConfiguration?
+
+    /// Leave the cursor out of the video once the receiver draws it itself.
+    func hideCursor() {
+        config.showsCursor = false
+        guard let stream, let streamConfig else { return }
+        streamConfig.showsCursor = false
+        stream.updateConfiguration(streamConfig) { error in
+            if let error { lunaLog("luna: could not hide the captured cursor: %@", error.localizedDescription) }
+        }
     }
 
     func stop() {

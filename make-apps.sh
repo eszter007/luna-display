@@ -9,7 +9,7 @@ VERSION=0.3.0
 BUILD=$(date +%Y%m%d%H%M)
 
 swift build -c release --arch arm64 --arch x86_64
-BIN=.build/apple/Products/Release
+BIN=$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)
 
 rm -rf dist
 mkdir -p dist

@@ -10,17 +10,18 @@ final class VirtualDisplaySession {
 
     var isActive: Bool { display != nil }
 
-    /// pixelWidth/pixelHeight are physical pixels. With hiDPI the desktop
-    /// "looks like" half that in each dimension (Retina).
-    func create(pixelWidth: UInt32, pixelHeight: UInt32, hiDPI: Bool, refreshHz: Double, name: String) -> Bool {
-        let modeWidth = hiDPI ? pixelWidth / 2 : pixelWidth
-        let modeHeight = hiDPI ? pixelHeight / 2 : pixelHeight
+    /// `modes` are in points; `defaultMode` is selected after creation. With
+    /// hiDPI each mode is offered as Retina (2x pixels) and as a non-Retina
+    /// "low resolution" variant. macOS adds its own fallback list
+    /// (800x600 ... 1920x1080) on top; the private API has no way to stop that.
+    func create(modes: [(UInt32, UInt32)], defaultMode: (UInt32, UInt32), hiDPI: Bool, refreshHz: Double, name: String) -> Bool {
+        let scale: UInt32 = hiDPI ? 2 : 1
         return create(
-            maxPixels: (pixelWidth, pixelHeight),
+            maxPixels: (modes.map(\.0).max()! * scale, modes.map(\.1).max()! * scale),
             hiDPIValue: hiDPI ? 1 : 0,
-            modes: [(modeWidth, modeHeight)],
-            targetPointWidth: Int(modeWidth),
-            targetPixelWidth: Int(pixelWidth),
+            modes: modes,
+            targetPointWidth: Int(defaultMode.0),
+            targetPixelWidth: Int(defaultMode.0 * scale),
             refreshHz: refreshHz,
             name: name
         )
@@ -53,8 +54,10 @@ final class VirtualDisplaySession {
             .flatMap(UInt32.init) ?? 0x0001
         desc.productID = 0x5C4E
         desc.vendorID = 0x4C58
-        desc.redPrimary = CGPoint(x: 0.640, y: 0.330)
-        desc.greenPrimary = CGPoint(x: 0.300, y: 0.600)
+        // Display P3, like the 2015+ 5K iMac panel and the sender's own
+        // screen. sRGB primaries here squeeze every wide-gamut color.
+        desc.redPrimary = CGPoint(x: 0.680, y: 0.320)
+        desc.greenPrimary = CGPoint(x: 0.265, y: 0.690)
         desc.bluePrimary = CGPoint(x: 0.150, y: 0.060)
         desc.whitePoint = CGPoint(x: 0.3127, y: 0.3290)
         desc.terminationHandler = { _, _ in

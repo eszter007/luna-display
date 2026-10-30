@@ -120,7 +120,8 @@ final class ReceiverServer {
                         name: Host.current().localizedName ?? "Mac",
                         // This build has no reverse camera/mic channel.
                         hasCamera: false,
-                        hasMic: false
+                        hasMic: false,
+                        drawsCursor: true
                     ),
                     completion: .contentProcessed { _ in }
                 )

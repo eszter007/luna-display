@@ -8,7 +8,7 @@
 //   frame        (4): [ptsMicros: i64 LE][flags: u8][AVCC data]   flags bit 0 = keyframe
 //
 // Receiver -> sender:
-//   caps         (2): JSON {v, maxW, maxH, name, cam, mic}
+//   caps         (2): JSON {v, maxW, maxH, name, cam, mic, cursor}
 //   camParamSets (5): same layout as paramSets
 //   camFrame     (6): same layout as frame
 //   audio        (7): [ptsMicros: i64 LE][sampleRate: u32 LE][channels: u8][PCM s16 LE interleaved]
@@ -16,12 +16,18 @@
 //
 // Sender -> receiver:
 //   capture      (8): JSON {cam: bool, mic: bool} — start/stop the iMac's camera and mic
+//   cursorImage (10): [hotX: f32][hotY: f32][width: f32][height: f32][PNG]
+//                     hot spot as a fraction of the image, size as a fraction of the display
+//   cursorPos   (11): [x: f32][y: f32][visible: u8] — hot spot as a fraction of the display, top-left origin
+//
+// Receivers that set caps.cursor draw the cursor themselves from cursorImage/
+// cursorPos, so it moves without waiting for capture, encode and decode.
 
 import Foundation
 
 public enum LunaMessage: Equatable {
     case hello(streamWidth: Int, streamHeight: Int, fps: Int, senderName: String)
-    case caps(screenWidth: Int, screenHeight: Int, name: String, hasCamera: Bool, hasMic: Bool)
+    case caps(screenWidth: Int, screenHeight: Int, name: String, hasCamera: Bool, hasMic: Bool, drawsCursor: Bool = false)
     case paramSets(sps: Data, pps: Data)
     case frame(ptsMicros: Int64, keyframe: Bool, data: Data)
     case camParamSets(sps: Data, pps: Data)
@@ -29,6 +35,8 @@ public enum LunaMessage: Equatable {
     case audio(ptsMicros: Int64, sampleRate: Int, channels: Int, pcm: Data)
     case capture(camera: Bool, mic: Bool)
     case captureStatus(camera: String, mic: String)
+    case cursorImage(hotX: Float, hotY: Float, width: Float, height: Float, png: Data)
+    case cursorPos(x: Float, y: Float, visible: Bool)
 
     /// High-rate media flowing back from the receiver (camera frames, audio).
     public var isReverseMedia: Bool {
@@ -49,6 +57,8 @@ public enum LunaWire {
     public static let typeAudio: UInt8 = 7
     public static let typeCapture: UInt8 = 8
     public static let typeCaptureStatus: UInt8 = 9
+    public static let typeCursorImage: UInt8 = 10
+    public static let typeCursorPos: UInt8 = 11
 
     public static let serviceType = "_lunax._tcp"
 
@@ -85,10 +95,30 @@ public enum LunaWire {
         envelope(type: typeHello, payload: json(["v": 2, "w": streamWidth, "h": streamHeight, "fps": fps, "name": senderName]))
     }
 
-    public static func capsData(screenWidth: Int, screenHeight: Int, name: String, hasCamera: Bool, hasMic: Bool) -> Data {
+    public static func capsData(screenWidth: Int, screenHeight: Int, name: String, hasCamera: Bool, hasMic: Bool, drawsCursor: Bool = false) -> Data {
         envelope(type: typeCaps, payload: json([
             "v": 2, "maxW": screenWidth, "maxH": screenHeight, "name": name, "cam": hasCamera, "mic": hasMic,
+            "cursor": drawsCursor,
         ]))
+    }
+
+    static func appendF32LE(_ d: inout Data, _ v: Float) {
+        appendU32LE(&d, v.bitPattern)
+    }
+
+    public static func cursorImageData(hotX: Float, hotY: Float, width: Float, height: Float, png: Data) -> Data {
+        var p = Data(capacity: png.count + 16)
+        for v in [hotX, hotY, width, height] { appendF32LE(&p, v) }
+        p.append(png)
+        return envelope(type: typeCursorImage, payload: p)
+    }
+
+    public static func cursorPosData(x: Float, y: Float, visible: Bool) -> Data {
+        var p = Data(capacity: 9)
+        appendF32LE(&p, x)
+        appendF32LE(&p, y)
+        p.append(visible ? 1 : 0)
+        return envelope(type: typeCursorPos, payload: p)
     }
 
     static func parameterSetsPayload(sps: Data, pps: Data) -> Data {
@@ -245,7 +275,8 @@ public final class LunaMessageParser {
                 screenHeight: dict["maxH"] as? Int ?? 0,
                 name: dict["name"] as? String ?? "Mac",
                 hasCamera: dict["cam"] as? Bool ?? false,
-                hasMic: dict["mic"] as? Bool ?? false
+                hasMic: dict["mic"] as? Bool ?? false,
+                drawsCursor: dict["cursor"] as? Bool ?? false
             )
         case LunaWire.typeParamSets:
             guard let ps = parameterSets(payload) else { return nil }
@@ -272,8 +303,23 @@ public final class LunaMessageParser {
         case LunaWire.typeCaptureStatus:
             guard let dict = jsonDict(payload) else { return nil }
             return .captureStatus(camera: dict["cam"] as? String ?? "off", mic: dict["mic"] as? String ?? "off")
+        case LunaWire.typeCursorImage:
+            guard payload.count >= 16 else { return nil }
+            let bytes = [UInt8](payload.prefix(16))
+            let png = payload.subdata(in: payload.index(payload.startIndex, offsetBy: 16) ..< payload.endIndex)
+            return .cursorImage(hotX: f32LE(bytes, at: 0), hotY: f32LE(bytes, at: 4),
+                                width: f32LE(bytes, at: 8), height: f32LE(bytes, at: 12), png: png)
+        case LunaWire.typeCursorPos:
+            guard payload.count >= 9 else { return nil }
+            let bytes = [UInt8](payload.prefix(9))
+            return .cursorPos(x: f32LE(bytes, at: 0), y: f32LE(bytes, at: 4), visible: bytes[8] & 1 == 1)
         default:
             return nil
         }
+    }
+
+    private static func f32LE(_ bytes: [UInt8], at offset: Int) -> Float {
+        Float(bitPattern: UInt32(bytes[offset]) | UInt32(bytes[offset + 1]) << 8
+            | UInt32(bytes[offset + 2]) << 16 | UInt32(bytes[offset + 3]) << 24)
     }
 }

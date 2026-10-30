@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import IOKit.pwr_mgt
 import LunaProto
 
@@ -10,6 +11,15 @@ final class ReceiverWindow: NSWindow {
 
 final class VideoHostView: NSView {
     let videoLayer: CALayer
+    /// The sender's cursor, drawn here from cursorPos messages so it moves
+    /// ahead of the video instead of with it.
+    private let cursorLayer = CALayer()
+    var streamSize = CGSize(width: 16, height: 9)
+    /// Hot spot as a fraction of the image, size as a fraction of the display.
+    private var cursorShape: (hot: CGPoint, size: CGSize)?
+    /// Hot spot as a fraction of the display, top-left origin.
+    private var cursorPosition = CGPoint.zero
+    private var cursorVisible = false
 
     init(videoLayer: CALayer) {
         self.videoLayer = videoLayer
@@ -19,6 +29,40 @@ final class VideoHostView: NSView {
         wantsLayer = true
         layer?.backgroundColor = CGColor(gray: 0, alpha: 1)
         layer?.addSublayer(videoLayer)
+        cursorLayer.contentsGravity = .resize
+        cursorLayer.isHidden = true
+        layer?.addSublayer(cursorLayer)
+    }
+
+    func setCursorImage(_ image: NSImage, hot: CGPoint, size: CGSize) {
+        cursorLayer.contents = image
+        cursorShape = (hot, size)
+        placeCursor()
+    }
+
+    func moveCursor(to position: CGPoint, visible: Bool) {
+        cursorPosition = position
+        cursorVisible = visible
+        placeCursor()
+    }
+
+    private func placeCursor() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        guard cursorVisible, let shape = cursorShape else {
+            cursorLayer.isHidden = true
+            return
+        }
+        // Same rect AVSampleBufferDisplayLayer's resizeAspect draws the video in.
+        let video = AVMakeRect(aspectRatio: streamSize, insideRect: bounds)
+        cursorLayer.bounds = CGRect(x: 0, y: 0,
+                                    width: shape.size.width * video.width,
+                                    height: shape.size.height * video.height)
+        cursorLayer.anchorPoint = CGPoint(x: shape.hot.x, y: 1 - shape.hot.y)
+        cursorLayer.position = CGPoint(x: video.minX + cursorPosition.x * video.width,
+                                       y: video.maxY - cursorPosition.y * video.height)
+        cursorLayer.isHidden = false
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -29,6 +73,7 @@ final class VideoHostView: NSView {
         CATransaction.setDisableActions(true)
         videoLayer.frame = bounds
         CATransaction.commit()
+        placeCursor()
     }
 }
 
@@ -36,6 +81,7 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
     private enum Mode { case fullscreen, windowed }
 
     private var window: ReceiverWindow!
+    private var host: VideoHostView!
     private let pipeline = VideoPipeline()
     private let server = ReceiverServer()
     private let statusField = NSTextField(labelWithString: "Starting…")
@@ -76,7 +122,7 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
         window.backgroundColor = .black
         window.isReleasedWhenClosed = false
 
-        let host = VideoHostView(videoLayer: pipeline.layer)
+        host = VideoHostView(videoLayer: pipeline.layer)
         window.contentView = host
 
         statusField.textColor = .white
@@ -227,6 +273,7 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
             let via = server.connectionInterfaceLabel.map { " via \($0)" } ?? ""
             statusField.stringValue = "Connected to \(name)\(via)…"
             streamSize = CGSize(width: CGFloat(w), height: CGFloat(h))
+            host.streamSize = streamSize!
             if mode == .windowed, let size = streamSize {
                 window.contentAspectRatio = size
                 let width = window.contentLayoutRect.width
@@ -242,12 +289,20 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
         case .frame(let pts, _, let data):
             guard !headless else { return }
             pipeline.enqueue(ptsMicros: pts, data: data)
+        case .cursorImage(let hotX, let hotY, let width, let height, let png):
+            guard !headless, let image = NSImage(data: png) else { return }
+            host.setCursorImage(image, hot: CGPoint(x: CGFloat(hotX), y: CGFloat(hotY)),
+                                size: CGSize(width: CGFloat(width), height: CGFloat(height)))
+        case .cursorPos(let x, let y, let visible):
+            guard !headless else { return }
+            host.moveCursor(to: CGPoint(x: CGFloat(x), y: CGFloat(y)), visible: visible)
         case .capture, .caps, .camParamSets, .camFrame, .audio, .captureStatus:
             break
         }
     }
 
     private func showWaiting() {
+        host?.moveCursor(to: .zero, visible: false)
         statusField.isHidden = false
         let hint = mode == .fullscreen ? "Press Esc to quit" : "Press Esc for full screen"
         statusField.stringValue =

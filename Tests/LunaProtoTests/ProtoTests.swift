@@ -31,6 +31,9 @@ final class ProtoTests: XCTestCase {
             LunaWire.audioData(ptsMicros: 42, sampleRate: 48_000, channels: 1, pcm: pcm),
             LunaWire.captureData(camera: true, mic: false),
             LunaWire.captureStatusData(camera: "streaming", mic: "denied"),
+            LunaWire.capsData(screenWidth: 5120, screenHeight: 2880, name: "iMac", hasCamera: false, hasMic: false, drawsCursor: true),
+            LunaWire.cursorImageData(hotX: 0.25, hotY: 0.5, width: 0.01, height: 0.02, png: pcm),
+            LunaWire.cursorPosData(x: 0.5, y: -0.125, visible: true),
         ]
         let expected: [LunaMessage] = [
             .hello(streamWidth: 3840, streamHeight: 2160, fps: 60, senderName: "MacBook"),
@@ -42,6 +45,9 @@ final class ProtoTests: XCTestCase {
             .audio(ptsMicros: 42, sampleRate: 48_000, channels: 1, pcm: pcm),
             .capture(camera: true, mic: false),
             .captureStatus(camera: "streaming", mic: "denied"),
+            .caps(screenWidth: 5120, screenHeight: 2880, name: "iMac", hasCamera: false, hasMic: false, drawsCursor: true),
+            .cursorImage(hotX: 0.25, hotY: 0.5, width: 0.01, height: 0.02, png: pcm),
+            .cursorPos(x: 0.5, y: -0.125, visible: true),
         ]
         for chunk in [1, 3, 7, 64, 1000, 100_000] {
             XCTAssertEqual(roundTrip(packets, chunk: chunk), expected, "chunk size \(chunk)")
