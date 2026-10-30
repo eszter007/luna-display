@@ -10,11 +10,14 @@ final class ReceiverWindow: NSWindow {
 }
 
 final class VideoHostView: NSView {
-    let videoLayer: CALayer
+    /// One layer per tile, left to right; each gets its strip of the video rect.
+    private var videoLayers: [CALayer]
     /// The sender's cursor, drawn here from cursorPos messages so it moves
     /// ahead of the video instead of with it.
     private let cursorLayer = CALayer()
-    var streamSize = CGSize(width: 16, height: 9)
+    var streamSize = CGSize(width: 16, height: 9) {
+        didSet { needsLayout = true }
+    }
     /// Hot spot as a fraction of the image, size as a fraction of the display.
     private var cursorShape: (hot: CGPoint, size: CGSize)?
     /// Hot spot as a fraction of the display, top-left origin.
@@ -22,7 +25,7 @@ final class VideoHostView: NSView {
     private var cursorVisible = false
 
     init(videoLayer: CALayer) {
-        self.videoLayer = videoLayer
+        videoLayers = [videoLayer]
         super.init(frame: .zero)
         // Layer-hosting view: the layer must be set before wantsLayer.
         layer = CALayer()
@@ -32,6 +35,13 @@ final class VideoHostView: NSView {
         cursorLayer.contentsGravity = .resize
         cursorLayer.isHidden = true
         layer?.addSublayer(cursorLayer)
+    }
+
+    func setVideoLayers(_ layers: [CALayer]) {
+        videoLayers.forEach { $0.removeFromSuperlayer() }
+        videoLayers = layers
+        layers.forEach { layer?.insertSublayer($0, below: cursorLayer) }
+        needsLayout = true
     }
 
     func setCursorImage(_ image: NSImage, hot: CGPoint, size: CGSize) {
@@ -71,7 +81,12 @@ final class VideoHostView: NSView {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        videoLayer.frame = bounds
+        let video = AVMakeRect(aspectRatio: streamSize, insideRect: bounds)
+        let stripWidth = video.width / CGFloat(videoLayers.count)
+        for (index, layer) in videoLayers.enumerated() {
+            layer.frame = CGRect(x: video.minX + CGFloat(index) * stripWidth, y: video.minY,
+                                 width: stripWidth, height: video.height)
+        }
         CATransaction.commit()
         placeCursor()
     }
@@ -82,7 +97,8 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
 
     private var window: ReceiverWindow!
     private var host: VideoHostView!
-    private let pipeline = VideoPipeline()
+    /// One per tile; H.264 streams always use the first.
+    private var pipelines = [VideoPipeline()]
     private let server = ReceiverServer()
     private let statusField = NSTextField(labelWithString: "Starting…")
     private var listeningText = "starting…"
@@ -122,7 +138,7 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
         window.backgroundColor = .black
         window.isReleasedWhenClosed = false
 
-        host = VideoHostView(videoLayer: pipeline.layer)
+        host = VideoHostView(videoLayer: pipelines[0].layer)
         window.contentView = host
 
         statusField.textColor = .white
@@ -170,7 +186,7 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
         }
         server.onDisconnected = { [weak self] in
             guard let self else { return }
-            self.pipeline.reset()
+            self.pipelines.forEach { $0.reset() }
             self.preventDisplaySleep(false)
             self.showWaiting()
         }
@@ -267,9 +283,14 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
 
     private func handle(_ message: LunaMessage) {
         switch message {
-        case .hello(let w, let h, let fps, let name):
-            lunaLog("luna: sender %@ streaming %dx%d@%d", name, w, h, fps)
+        case .hello(let w, let h, let fps, let name, let tiles):
+            lunaLog("luna: sender %@ streaming %dx%d@%d in %d tile(s)", name, w, h, fps, tiles)
             guard !headless else { return }
+            if pipelines.count != max(tiles, 1) {
+                pipelines.forEach { $0.reset() }
+                pipelines = (0 ..< max(tiles, 1)).map { _ in VideoPipeline() }
+                host.setVideoLayers(pipelines.map(\.layer))
+            }
             let via = server.connectionInterfaceLabel.map { " via \($0)" } ?? ""
             statusField.stringValue = "Connected to \(name)\(via)…"
             streamSize = CGSize(width: CGFloat(w), height: CGFloat(h))
@@ -284,15 +305,18 @@ final class ReceiverAppDelegate: NSObject, NSApplicationDelegate {
             preventDisplaySleep(true)
         case .paramSets(let sps, let pps):
             guard !headless else { return }
-            pipeline.setParameterSets([sps, pps], hevc: false)
+            pipelines[0].setParameterSets([sps, pps], hevc: false)
             statusField.isHidden = true
-        case .hevcParamSets(let sets):
-            guard !headless else { return }
-            pipeline.setParameterSets(sets, hevc: true)
+        case .hevcParamSets(let tile, let sets):
+            guard !headless, pipelines.indices.contains(tile) else { return }
+            pipelines[tile].setParameterSets(sets, hevc: true)
             statusField.isHidden = true
         case .frame(let pts, _, let data):
             guard !headless else { return }
-            pipeline.enqueue(ptsMicros: pts, data: data)
+            pipelines[0].enqueue(ptsMicros: pts, data: data)
+        case .hevcFrame(let tile, let pts, _, let data):
+            guard !headless, pipelines.indices.contains(tile) else { return }
+            pipelines[tile].enqueue(ptsMicros: pts, data: data)
         case .cursorImage(let hotX, let hotY, let width, let height, let png):
             guard !headless, let image = NSImage(data: png) else { return }
             host.setCursorImage(image, hot: CGPoint(x: CGFloat(hotX), y: CGFloat(hotY)),

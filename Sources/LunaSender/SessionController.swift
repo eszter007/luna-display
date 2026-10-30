@@ -237,7 +237,8 @@ final class SessionController {
             streamWidth: stream.width,
             streamHeight: stream.height,
             fps: fps,
-            senderName: Host.current().localizedName ?? "Mac"
+            senderName: Host.current().localizedName ?? "Mac",
+            tiles: useHEVC ? 2 : 1
         ))
 
         guard virtualDisplay.create(
@@ -268,7 +269,8 @@ final class SessionController {
             fps: fps,
             bitrate: bitrate,
             showsCursor: !receiverDrawsCursor,
-            hevc: useHEVC
+            hevc: useHEVC,
+            tiles: 2
         ))
         self.encoder = encoder
         encoder.onPacket = { [weak connection] packet in

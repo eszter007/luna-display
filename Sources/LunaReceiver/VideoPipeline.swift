@@ -11,7 +11,8 @@ final class VideoPipeline {
     private var formatDescription: CMVideoFormatDescription?
 
     init() {
-        layer.videoGravity = .resizeAspect
+        // The host view sizes each layer to exactly its part of the picture.
+        layer.videoGravity = .resize
         layer.backgroundColor = CGColor(gray: 0, alpha: 1)
     }
 
@@ -19,6 +20,16 @@ final class VideoPipeline {
         formatDescription = nil
         layer.flush()
     }
+
+    /// What the sender always encodes (Display P3, sRGB curve, full range),
+    /// set explicitly because Tahoe on the 2020 iMac showed HEVC washed out
+    /// when left to read these from the stream.
+    private static let senderColorTags = [
+        kCMFormatDescriptionExtension_ColorPrimaries: kCMFormatDescriptionColorPrimaries_P3_D65,
+        kCMFormatDescriptionExtension_TransferFunction: kCMFormatDescriptionTransferFunction_sRGB,
+        kCMFormatDescriptionExtension_YCbCrMatrix: kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2,
+        kCMFormatDescriptionExtension_FullRangeVideo: kCFBooleanTrue!,
+    ] as CFDictionary
 
     /// SPS, PPS for H.264; VPS, SPS, PPS for HEVC.
     func setParameterSets(_ sets: [Data], hevc: Bool) {
@@ -41,7 +52,7 @@ final class VideoPipeline {
                     parameterSetPointers: pointers,
                     parameterSetSizes: sizes,
                     nalUnitHeaderLength: 4,
-                    extensions: nil,
+                    extensions: Self.senderColorTags,
                     formatDescriptionOut: &desc
                 )
             }

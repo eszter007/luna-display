@@ -28,7 +28,9 @@ launch, then jump to [Setup](#setup). Building from source is optional.
    commercial tools use. No dongle needed.
 2. ScreenCaptureKit captures it at 60 fps and the hardware encoder
    compresses it. When the receiver can hardware-decode HEVC (e.g. the
-   2020 iMac) the full 5120×2880 frame goes out as HEVC at 120 Mbit/s;
+   2020 iMac) the full 5120×2880 frame goes out as HEVC at 120 Mbit/s,
+   split into two 2560×2880 halves that the encoder works on in parallel
+   (one 5K stream takes ~27 ms per frame on an M5 Pro, two halves ~14 ms);
    otherwise it falls back to H.264 at 3840×2160.
 3. **LunaReceiver** (the iMac, fullscreen app) advertises itself over
    Bonjour, receives the stream over TCP, and feeds compressed samples

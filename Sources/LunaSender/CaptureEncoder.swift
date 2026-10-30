@@ -18,12 +18,15 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
         var bitrate: Int
         var showsCursor = true
         var hevc = false
+        /// Vertical strips, each its own encoder session (HEVC only).
+        var tiles = 1
     }
 
     private var config: Config
     private let captureQueue = DispatchQueue(label: "luna.capture", qos: .userInteractive)
     private var stream: SCStream?
-    private var encoder: VideoEncoder?
+    private var encoders: [VideoEncoder] = []
+    private var tilePool: CVPixelBufferPool?
 
     /// Called with wire-ready packets (paramSets / frame envelopes).
     var onPacket: ((Data) -> Void)?
@@ -32,7 +35,7 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
     var shouldDropFrame: (() -> Bool)?
     var onError: ((String) -> Void)?
 
-    var framesSent: Int { encoder?.framesEncoded ?? 0 }
+    var framesSent: Int { encoders.first?.framesEncoded ?? 0 }
     private(set) var framesDropped = 0
 
     /// Written into the H.264 VUI so the receiver color-manages the stream as
@@ -50,23 +53,34 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func start() {
+        let tiles = config.hevc ? config.tiles : 1
         var encoderConfig = VideoEncoder.Config(
-            width: config.streamWidth, height: config.streamHeight, fps: config.fps, bitrate: config.bitrate,
-            colorProperties: Self.colorProperties
+            width: config.streamWidth / tiles, height: config.streamHeight, fps: config.fps,
+            bitrate: config.bitrate / tiles, colorProperties: Self.colorProperties
         )
         encoderConfig.hevc = config.hevc
-        guard let encoder = VideoEncoder(config: encoderConfig) else {
-            onError?("Could not create the \(config.hevc ? "HEVC" : "H.264") encoder")
-            return
+        for tile in 0 ..< tiles {
+            guard let encoder = VideoEncoder(config: encoderConfig) else {
+                onError?("Could not create the \(config.hevc ? "HEVC" : "H.264") encoder")
+                return
+            }
+            if config.hevc {
+                encoder.onParameterSets = { [weak self] sets in
+                    self?.onPacket?(LunaWire.hevcParamSetsData(tile: tile, sets: sets))
+                }
+                encoder.onEncodedFrame = { [weak self] pts, keyframe, data in
+                    self?.onPacket?(LunaWire.hevcFrameData(tile: tile, ptsMicros: pts, keyframe: keyframe, data: data))
+                }
+            } else {
+                encoder.onParameterSets = { [weak self] sets in
+                    self?.onPacket?(LunaWire.paramSetsData(sps: sets[0], pps: sets[1]))
+                }
+                encoder.onEncodedFrame = { [weak self] pts, keyframe, avcc in
+                    self?.onPacket?(LunaWire.frameData(ptsMicros: pts, keyframe: keyframe, avcc: avcc))
+                }
+            }
+            encoders.append(encoder)
         }
-        let hevc = config.hevc
-        encoder.onParameterSets = { [weak self] sets in
-            self?.onPacket?(hevc ? LunaWire.hevcParamSetsData(sets) : LunaWire.paramSetsData(sps: sets[0], pps: sets[1]))
-        }
-        encoder.onEncodedFrame = { [weak self] pts, keyframe, avcc in
-            self?.onPacket?(LunaWire.frameData(ptsMicros: pts, keyframe: keyframe, avcc: avcc))
-        }
-        self.encoder = encoder
 
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { [weak self] content, error in
             guard let self else { return }
@@ -128,8 +142,8 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
     func stop() {
         stream?.stopCapture { _ in }
         stream = nil
-        encoder?.invalidate()
-        encoder = nil
+        encoders.forEach { $0.invalidate() }
+        encoders = []
     }
 
     // MARK: - SCStreamOutput
@@ -141,14 +155,62 @@ final class CaptureEncoder: NSObject, SCStreamOutput, SCStreamDelegate {
               let statusRaw = attachments[SCStreamFrameInfo.status.rawValue] as? Int,
               statusRaw == SCFrameStatus.complete.rawValue,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
-              let encoder
+              !encoders.isEmpty
         else { return }
 
         if shouldDropFrame?() == true {
             framesDropped += 1
             return
         }
-        encoder.encode(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if encoders.count == 1 {
+            encoders[0].encode(pixelBuffer, pts: pts)
+            return
+        }
+        for (index, encoder) in encoders.enumerated() {
+            guard let strip = copyStrip(pixelBuffer, index: index, count: encoders.count) else { return }
+            encoder.encode(strip, pts: pts)
+        }
+    }
+
+    /// Copies one vertical strip of a bi-planar 4:2:0 frame into a pooled
+    /// buffer. ponytail: CPU copy, about 2 ms per 5K frame on Apple Silicon;
+    /// a VTPixelTransferSession crop would move it to the GPU if that matters.
+    private func copyStrip(_ source: CVPixelBuffer, index: Int, count: Int) -> CVPixelBuffer? {
+        let width = CVPixelBufferGetWidth(source) / count
+        let height = CVPixelBufferGetHeight(source)
+        if tilePool == nil {
+            let attributes: [CFString: Any] = [
+                kCVPixelBufferPixelFormatTypeKey: CVPixelBufferGetPixelFormatType(source),
+                kCVPixelBufferWidthKey: width,
+                kCVPixelBufferHeightKey: height,
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+            ]
+            CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &tilePool)
+        }
+        var strip: CVPixelBuffer?
+        guard let tilePool, CVPixelBufferPoolCreatePixelBuffer(nil, tilePool, &strip) == kCVReturnSuccess,
+              let strip
+        else { return nil }
+        CVPixelBufferLockBaseAddress(source, .readOnly)
+        CVPixelBufferLockBaseAddress(strip, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(strip, [])
+            CVPixelBufferUnlockBaseAddress(source, .readOnly)
+        }
+        for plane in 0 ..< CVPixelBufferGetPlaneCount(source) {
+            // Both planes are one byte per luma column: Y, then interleaved CbCr at half height.
+            guard let from = CVPixelBufferGetBaseAddressOfPlane(source, plane),
+                  let to = CVPixelBufferGetBaseAddressOfPlane(strip, plane)
+            else { return nil }
+            let fromStride = CVPixelBufferGetBytesPerRowOfPlane(source, plane)
+            let toStride = CVPixelBufferGetBytesPerRowOfPlane(strip, plane)
+            for row in 0 ..< CVPixelBufferGetHeightOfPlane(strip, plane) {
+                memcpy(to + row * toStride, from + row * fromStride + index * width, width)
+            }
+        }
+        CVBufferPropagateAttachments(source, strip)
+        return strip
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
